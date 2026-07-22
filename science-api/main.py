@@ -24,16 +24,14 @@ from xgboost import XGBClassifier
 app = FastAPI(title="LÚCIDA Science API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "https://explainable-ai-studio.pedrojoao950.chatgpt.site",
+    ],
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
-    allow_origins=[
-    "http://localhost:3000",
-    "http://localhost:5173",
-    "https://explainable-ai-studio.pedrojoao950.chatgpt.site",
-],
 )
-
 
 class Health(BaseModel):
     status: str
