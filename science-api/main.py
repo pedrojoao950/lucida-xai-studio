@@ -46,7 +46,7 @@ from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
 
 SEED = 42
-app = FastAPI(title="LÚCIDA Science API", version="7.5")
+app = FastAPI(title="LÚCIDA Science API", version="7.6")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -191,7 +191,7 @@ def _paired_f1_comparison(y_true, champion_probability, candidate_probability, c
 
 @app.get("/")
 def root():
-    return {"service": "LÚCIDA Science API", "version": "7.5", "status": "online"}
+    return {"service": "LÚCIDA Science API", "version": "7.6", "status": "online"}
 
 
 @app.get("/health")
@@ -218,12 +218,17 @@ async def train(
     xai_model: str = Form(""),
     fairness_declaration: Literal["evaluate", "no_protected_attributes", "not_evaluated"] = Form("not_evaluated"),
     threshold_approved: bool = Form(False),
+    approver_name: str = Form(""),
+    approver_role: str = Form(""),
+    approval_reason: str = Form(""),
+    lifecycle_state: Literal["candidate", "in_review", "approved", "deployed", "retired"] = Form("candidate"),
 ):
     if folds not in (5, 10):
         raise HTTPException(422, "folds deve ser 5 ou 10")
     if not .05 <= threshold <= .95:
         raise HTTPException(422, "threshold deve estar entre 0.05 e 0.95")
     raw = await file.read()
+    experiment_id = str(uuid.uuid4())
     try:
         frame = pd.read_csv(pd.io.common.BytesIO(raw), sep=None, engine="python")
         excluded = json.loads(excluded_features)
@@ -486,6 +491,71 @@ async def train(
         comparison["candidate"] for comparison in statistical_comparison
         if comparison["statistical_tie"] or comparison["candidate"] == champion
     ]
+    champion_result = next(result for result in results if result["algorithm"] == champion)
+    fairness_complete = fairness_declaration == "no_protected_attributes" or (
+        fairness_declaration == "evaluate" and bool(protected_feature) and champion_result["fairness"] is not None
+    )
+    approval_complete = threshold_approved and bool(approver_name.strip()) and bool(approver_role.strip()) and bool(approval_reason.strip())
+    robustness_complete = (
+        champion_result["robustness"]["stability_score"] >= .85
+        and champion_result["robustness"]["worst_f1_degradation"] <= .15
+    )
+    readiness_checks = [
+        {"id": "holdout", "label": "Holdout bloqueado", "passed": True, "severity": "required"},
+        {"id": "threshold", "label": "Limiar aprovado com responsável", "passed": approval_complete, "severity": "required"},
+        {"id": "fairness", "label": "Equidade avaliada ou declarada", "passed": fairness_complete, "severity": "required"},
+        {"id": "robustness", "label": "Estabilidade ≥85% e degradação F1 ≤15%", "passed": robustness_complete, "severity": "required"},
+        {"id": "temporal", "label": "Validação temporal", "passed": validation == "temporal", "severity": "recommended"},
+    ]
+    blockers = [check["label"] for check in readiness_checks if check["severity"] == "required" and not check["passed"]]
+    warnings = [check["label"] for check in readiness_checks if check["severity"] == "recommended" and not check["passed"]]
+    readiness_status = "blocked" if blockers else "conditional" if warnings else "ready"
+    requested_state = lifecycle_state
+    effective_state = lifecycle_state
+    if lifecycle_state in ("approved", "deployed") and readiness_status == "blocked":
+        effective_state = "in_review"
+    artifact_seed = json.dumps({
+        "dataset": hashlib.sha256(raw).hexdigest(),
+        "model": champion,
+        "threshold": threshold,
+        "pipeline": [encoding, scaling, numeric_imputer, categorical_imputer, imbalance],
+    }, sort_keys=True).encode()
+    artifact_hash = hashlib.sha256(artifact_seed).hexdigest()
+    model_version = f"lucida-{champion.lower().replace(' ', '-')}-{artifact_hash[:8]}"
+    monitoring_numeric = {}
+    for column in X_dev.select_dtypes(include=np.number).columns:
+        series = X_dev[column].dropna()
+        monitoring_numeric[str(column)] = {
+            "mean": float(series.mean()),
+            "std": float(series.std() or 0),
+            "q05": float(series.quantile(.05)),
+            "q50": float(series.quantile(.50)),
+            "q95": float(series.quantile(.95)),
+            "missing_rate": float(X_dev[column].isna().mean()),
+        }
+    monitoring_categorical = {}
+    for column in X_dev.select_dtypes(exclude=np.number).columns:
+        proportions = X_dev[column].astype(str).value_counts(normalize=True).head(10)
+        monitoring_categorical[str(column)] = {str(key): float(value) for key, value in proportions.items()}
+    champion_probability_array = np.asarray(champion_probability)
+    monitoring_baseline = {
+        "source": "development_and_locked_holdout",
+        "numeric_features": monitoring_numeric,
+        "categorical_features": monitoring_categorical,
+        "prediction_distribution": {
+            "mean": float(champion_probability_array.mean()),
+            "q05": float(np.quantile(champion_probability_array, .05)),
+            "q50": float(np.quantile(champion_probability_array, .50)),
+            "q95": float(np.quantile(champion_probability_array, .95)),
+            "positive_rate_at_approved_threshold": float((champion_probability_array >= threshold).mean()),
+        },
+        "alert_policy": {
+            "psi_warning": .10,
+            "psi_critical": .25,
+            "performance_drop_warning": .05,
+            "fairness_gap_warning": .10,
+        },
+    }
     explanation_model = xai_model if xai_model in fitted_artifacts else champion
     explanation_artifact = fitted_artifacts[explanation_model]
     explanation_pipeline = explanation_artifact["pipeline"]
@@ -536,8 +606,8 @@ async def train(
         except Exception:
             continue
     return {
-        "schema_version": "7.5",
-        "experiment_id": str(uuid.uuid4()),
+        "schema_version": "7.6",
+        "experiment_id": experiment_id,
         "dataset_sha256": hashlib.sha256(raw).hexdigest(),
         "random_seed": SEED,
         "runtime": {
@@ -572,13 +642,22 @@ async def train(
         "governance": {
             "fairness_declaration": fairness_declaration,
             "protected_feature": protected_feature or None,
-            "threshold_approved": threshold_approved,
-            "approved_threshold": threshold if threshold_approved else None,
-            "approval_timestamp": pd.Timestamp.utcnow().isoformat() if threshold_approved else None,
+            "threshold_approved": approval_complete,
+            "approved_threshold": threshold if approval_complete else None,
+            "approval": {
+                "approver_name": approver_name or None,
+                "approver_role": approver_role or None,
+                "reason": approval_reason or None,
+                "timestamp": pd.Timestamp.utcnow().isoformat() if approval_complete else None,
+            },
+            "requested_lifecycle_state": requested_state,
+            "effective_lifecycle_state": effective_state,
         },
         "model_card": {
             "model": champion,
-            "status": "candidate",
+            "version": model_version,
+            "artifact_manifest_sha256": artifact_hash,
+            "status": effective_state,
             "intended_use": "Binary classification decision support under human oversight.",
             "dataset_sha256": hashlib.sha256(raw).hexdigest(),
             "positive_class": positive_class,
@@ -590,11 +669,40 @@ async def train(
             ],
             "deployment_readiness": {
                 "holdout_locked": True,
-                "threshold_approved": threshold_approved,
-                "fairness_declared": fairness_declaration != "not_evaluated",
+                "threshold_approved": approval_complete,
+                "fairness_declared": fairness_complete,
                 "robustness_scientific": True,
+                "robustness_policy_passed": robustness_complete,
             },
         },
+        "deployment_readiness": {
+            "status": readiness_status,
+            "checks": readiness_checks,
+            "blockers": blockers,
+            "warnings": warnings,
+            "decision": "Implantação bloqueada" if blockers else "Pronto com condições" if warnings else "Pronto para implantação",
+        },
+        "model_registry": {
+            "model_version": model_version,
+            "artifact_manifest_sha256": artifact_hash,
+            "lifecycle_state": effective_state,
+            "requested_state": requested_state,
+            "rollback": {
+                "previous_version": None,
+                "ready": False,
+                "reason": "Nenhuma versão anterior foi fornecida nesta experiência.",
+            },
+        },
+        "audit_trail": [{
+            "event": "threshold_approval",
+            "status": "approved" if approval_complete else "incomplete",
+            "actor": approver_name or None,
+            "role": approver_role or None,
+            "reason": approval_reason or None,
+            "threshold": threshold,
+            "experiment_id": experiment_id,
+        }],
+        "monitoring_baseline": monitoring_baseline,
         "scientific_protocol": {
             "holdout_locked": True,
             "calibration_selection": "cross_fitted_out_of_fold_development",
@@ -603,6 +711,7 @@ async def train(
             "confidence_intervals": "bootstrap_95_percent_400_resamples",
             "robustness": "numeric_noise_and_missingness_stress_tests",
             "model_comparison": "paired_bootstrap_holdout_f1",
+            "deployment_gate": "required_and_recommended_checks",
         },
         "explainability": {
             "source": "science-api",
