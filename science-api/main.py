@@ -587,10 +587,10 @@ async def train(
         "reference": X_dev.copy(),
         "baseline_probability": champion_probability_array,
         "xai": {
-            "model": xai_model if xai_model in fitted_artifacts else champion,
-            "pipeline": fitted_artifacts[xai_model if xai_model in fitted_artifacts else champion]["pipeline"],
-            "X_dev": fitted_artifacts[xai_model if xai_model in fitted_artifacts else champion]["X_dev"].copy(),
-            "X_test": fitted_artifacts[xai_model if xai_model in fitted_artifacts else champion]["X_test"].copy(),
+            "model": champion,
+            "pipeline": fitted_artifacts[champion]["pipeline"],
+            "X_dev": fitted_artifacts[champion]["X_dev"].copy(),
+            "X_test": fitted_artifacts[champion]["X_test"].copy(),
         },
         "created_at": pd.Timestamp.utcnow().isoformat(),
     }
@@ -625,7 +625,7 @@ async def train(
         "model_identity": {
             "champion": champion,
             "deployment_candidate": champion,
-            "explanation_model": xai_model if xai_model in fitted_artifacts else champion,
+            "explanation_model": champion,
             "consistent": True,
         },
         "threshold_policy": {
@@ -719,7 +719,7 @@ async def train(
         "explainability": {
             "source": "science-api",
             "status": "deferred",
-            "model": xai_model if xai_model in fitted_artifacts else champion,
+            "model": champion,
             "shap_global": [],
             "lime_local": {"holdout_row": 0, "features": [], "note": "Explicações serão calculadas numa execução dedicada."},
             "partial_dependence": [],
