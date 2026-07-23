@@ -50,7 +50,7 @@ from xgboost import XGBClassifier
 
 SEED = 42
 MODEL_CACHE: dict[str, dict] = {}
-app = FastAPI(title="LÚCIDA Science API", version="7.8")
+app = FastAPI(title="LÚCIDA Science API", version="7.9")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -228,7 +228,7 @@ def _paired_f1_comparison(y_true, champion_probability, candidate_probability, c
 
 @app.get("/")
 def root():
-    return {"service": "LÚCIDA Science API", "version": "7.8", "status": "online"}
+    return {"service": "LÚCIDA Science API", "version": "7.9", "status": "online"}
 
 
 @app.get("/health")
@@ -673,7 +673,7 @@ async def train(
         "created_at": pd.Timestamp.utcnow().isoformat(),
     }
     return {
-        "schema_version": "7.8",
+        "schema_version": "7.9",
         "experiment_id": experiment_id,
         "dataset_sha256": hashlib.sha256(raw).hexdigest(),
         "random_seed": SEED,
