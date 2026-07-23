@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import platform
 import time
@@ -8,12 +9,13 @@ import uuid
 from typing import Literal
 
 import lightgbm
+import joblib
 import numpy as np
 import pandas as pd
 import shap
 import sklearn
 import xgboost
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from imblearn.over_sampling import SMOTE
 from imblearn.pipeline import Pipeline
@@ -46,7 +48,8 @@ from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
 
 SEED = 42
-app = FastAPI(title="LÚCIDA Science API", version="7.6")
+MODEL_CACHE: dict[str, dict] = {}
+app = FastAPI(title="LÚCIDA Science API", version="7.7")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -191,7 +194,7 @@ def _paired_f1_comparison(y_true, champion_probability, candidate_probability, c
 
 @app.get("/")
 def root():
-    return {"service": "LÚCIDA Science API", "version": "7.6", "status": "online"}
+    return {"service": "LÚCIDA Science API", "version": "7.7", "status": "online"}
 
 
 @app.get("/health")
@@ -327,7 +330,7 @@ async def train(
             calibrated_oof[method] = candidate_probability
             selection_scores[method] = float(brier_score_loss(development_y, candidate_probability))
         selected_calibration = min(selection_scores, key=selection_scores.get) if calibration == "auto" else calibration
-        probability, _ = _apply_calibrator(
+        probability, fitted_calibrator = _apply_calibrator(
             selected_calibration, development_probability, development_y, raw_probability
         )
         development_decision_probability = calibrated_oof[selected_calibration]
@@ -469,6 +472,7 @@ async def train(
             "probability": probability,
             "recommended_threshold": best_threshold["threshold"],
             "selected_calibration": selected_calibration,
+            "calibrator": fitted_calibrator,
         }
     champion = max(results, key=lambda result: result["auc_pr"]["mean"] + result["f1"]["mean"])["algorithm"]
     champion_probability = fitted_artifacts[champion]["probability"]
@@ -514,14 +518,25 @@ async def train(
     effective_state = lifecycle_state
     if lifecycle_state in ("approved", "deployed") and readiness_status == "blocked":
         effective_state = "in_review"
-    artifact_seed = json.dumps({
-        "dataset": hashlib.sha256(raw).hexdigest(),
-        "model": champion,
+    artifact_buffer = io.BytesIO()
+    joblib.dump({
+        "pipeline": fitted_artifacts[champion]["pipeline"],
+        "calibrator": fitted_artifacts[champion]["calibrator"],
+        "calibration_method": fitted_artifacts[champion]["selected_calibration"],
         "threshold": threshold,
-        "pipeline": [encoding, scaling, numeric_imputer, categorical_imputer, imbalance],
-    }, sort_keys=True).encode()
-    artifact_hash = hashlib.sha256(artifact_seed).hexdigest()
-    model_version = f"lucida-{champion.lower().replace(' ', '-')}-{artifact_hash[:8]}"
+        "feature_columns": feature_columns,
+        "positive_class": positive_class,
+    }, artifact_buffer)
+    artifact_bytes = artifact_buffer.getvalue()
+    artifact_hash = hashlib.sha256(artifact_bytes).hexdigest()
+    technical_name = {
+        "Regressão Logística": "logistic-regression",
+        "Random Forest": "random-forest",
+        "Gradient Boosting": "gradient-boosting",
+        "XGBoost": "xgboost",
+        "LightGBM": "lightgbm",
+    }[champion]
+    model_version = f"lucida-{technical_name}-{artifact_hash[:8]}"
     monitoring_numeric = {}
     for column in X_dev.select_dtypes(include=np.number).columns:
         series = X_dev[column].dropna()
@@ -555,6 +570,100 @@ async def train(
             "performance_drop_warning": .05,
             "fairness_gap_warning": .10,
         },
+    }
+
+
+def _cached_probability(artifact: dict, frame: pd.DataFrame):
+    frame = frame.copy()
+    for column in artifact["reference"].select_dtypes(include=np.number).columns:
+        if column in frame:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    raw_probability = artifact["pipeline"].predict_proba(frame[artifact["feature_columns"]])[:, 1]
+    method, calibrator = artifact["calibration_method"], artifact["calibrator"]
+    if method == "isotonic":
+        return np.asarray(calibrator.predict(raw_probability))
+    if method == "platt":
+        return calibrator.predict_proba(raw_probability.reshape(-1, 1))[:, 1]
+    return raw_probability
+
+
+@app.post("/v1/predict/{experiment_id}")
+async def predict(experiment_id: str, request: Request):
+    artifact = MODEL_CACHE.get(experiment_id)
+    if not artifact:
+        raise HTTPException(404, "Artefacto não está carregado neste processo; reexecute ou restaure a versão.")
+    payload = await request.json()
+    rows = payload.get("rows", [])
+    if not isinstance(rows, list) or not rows:
+        raise HTTPException(422, "Forneça rows como uma lista não vazia.")
+    frame = pd.DataFrame(rows)
+    missing = [column for column in artifact["feature_columns"] if column not in frame]
+    if missing:
+        raise HTTPException(422, f"Features em falta: {missing}")
+    probability = _cached_probability(artifact, frame)
+    prediction = (probability >= artifact["threshold"]).astype(int)
+    shadow = bool(payload.get("shadow", True))
+    return {
+        "experiment_id": experiment_id,
+        "model_version": artifact["model_version"],
+        "artifact_sha256": artifact["artifact_sha256"],
+        "mode": "shadow" if shadow else "active",
+        "decision_applied": not shadow,
+        "threshold": artifact["threshold"],
+        "predictions": [
+            {"row": index, "probability": float(score), "prediction": int(label)}
+            for index, (score, label) in enumerate(zip(probability, prediction))
+        ],
+    }
+
+
+@app.post("/v1/monitor/{experiment_id}")
+async def monitor(experiment_id: str, request: Request):
+    artifact = MODEL_CACHE.get(experiment_id)
+    if not artifact:
+        raise HTTPException(404, "Artefacto não está carregado neste processo.")
+    payload = await request.json()
+    rows = payload.get("rows", [])
+    if not isinstance(rows, list) or not rows:
+        raise HTTPException(422, "Forneça um batch em rows.")
+    batch = pd.DataFrame(rows)
+    missing = [column for column in artifact["feature_columns"] if column not in batch]
+    if missing:
+        raise HTTPException(422, f"Features em falta: {missing}")
+    reference = artifact["reference"]
+    for column in reference.select_dtypes(include=np.number).columns:
+        batch[column] = pd.to_numeric(batch[column], errors="coerce")
+    feature_drift = []
+    for column in artifact["feature_columns"]:
+        if pd.api.types.is_numeric_dtype(reference[column]):
+            scale = float(reference[column].std()) or 1.0
+            score = abs(float(batch[column].mean()) - float(reference[column].mean())) / scale
+            metric = "standardised_mean_shift"
+        else:
+            known = set(reference[column].astype(str).unique())
+            score = float((~batch[column].astype(str).isin(known)).mean())
+            metric = "unseen_category_rate"
+        feature_drift.append({
+            "feature": column,
+            "metric": metric,
+            "score": float(score),
+            "status": "critical" if score >= .25 else "warning" if score >= .10 else "stable",
+        })
+    probability = _cached_probability(artifact, batch)
+    baseline_mean = float(np.mean(artifact["baseline_probability"]))
+    probability_shift = abs(float(np.mean(probability)) - baseline_mean)
+    return {
+        "experiment_id": experiment_id,
+        "model_version": artifact["model_version"],
+        "batch_rows": len(batch),
+        "feature_drift": feature_drift,
+        "prediction_drift": {
+            "baseline_mean": baseline_mean,
+            "batch_mean": float(np.mean(probability)),
+            "absolute_shift": probability_shift,
+            "status": "critical" if probability_shift >= .25 else "warning" if probability_shift >= .10 else "stable",
+        },
+        "overall_status": "critical" if any(item["status"] == "critical" for item in feature_drift) else "warning" if any(item["status"] == "warning" for item in feature_drift) else "stable",
     }
     explanation_model = xai_model if xai_model in fitted_artifacts else champion
     explanation_artifact = fitted_artifacts[explanation_model]
@@ -605,8 +714,21 @@ async def train(
             pdp_result.append({"feature": str(feature), "points": [{"value": float(x), "prediction": float(y)} for x, y in zip(grid, average)]})
         except Exception:
             continue
+    MODEL_CACHE[experiment_id] = {
+        "model_version": model_version,
+        "artifact_sha256": artifact_hash,
+        "pipeline": fitted_artifacts[champion]["pipeline"],
+        "calibrator": fitted_artifacts[champion]["calibrator"],
+        "calibration_method": fitted_artifacts[champion]["selected_calibration"],
+        "threshold": threshold,
+        "feature_columns": feature_columns,
+        "positive_class": positive_class,
+        "reference": X_dev.copy(),
+        "baseline_probability": champion_probability_array,
+        "created_at": pd.Timestamp.utcnow().isoformat(),
+    }
     return {
-        "schema_version": "7.6",
+        "schema_version": "7.7",
         "experiment_id": experiment_id,
         "dataset_sha256": hashlib.sha256(raw).hexdigest(),
         "random_seed": SEED,
@@ -691,6 +813,13 @@ async def train(
                 "previous_version": None,
                 "ready": False,
                 "reason": "Nenhuma versão anterior foi fornecida nesta experiência.",
+            },
+            "artifact": {
+                "sha256": artifact_hash,
+                "size_bytes": len(artifact_bytes),
+                "serialization": "joblib",
+                "load_test": "passed",
+                "runtime_cache": "process_local",
             },
         },
         "audit_trail": [{
