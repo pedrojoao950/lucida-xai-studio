@@ -46,7 +46,7 @@ from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
 
 SEED = 42
-app = FastAPI(title="LÚCIDA Science API", version="7.4")
+app = FastAPI(title="LÚCIDA Science API", version="7.5")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -168,9 +168,30 @@ def _display_feature(name: str):
     return name.replace("numeric__", "").replace("categorical__", "").replace("_", " ")
 
 
+def _paired_f1_comparison(y_true, champion_probability, candidate_probability, champion_threshold, candidate_threshold):
+    truth = np.asarray(y_true)
+    rng = np.random.default_rng(SEED)
+    differences = []
+    for _ in range(400):
+        index = rng.integers(0, len(truth), len(truth))
+        champion_prediction = (np.asarray(champion_probability)[index] >= champion_threshold).astype(int)
+        candidate_prediction = (np.asarray(candidate_probability)[index] >= candidate_threshold).astype(int)
+        differences.append(
+            f1_score(truth[index], candidate_prediction, zero_division=0)
+            - f1_score(truth[index], champion_prediction, zero_division=0)
+        )
+    lower, upper = np.quantile(differences, [.025, .975])
+    return {
+        "metric": "holdout_f1_difference_candidate_minus_champion",
+        "difference_mean": float(np.mean(differences)),
+        "ci95": {"lower": float(lower), "upper": float(upper)},
+        "statistical_tie": bool(lower <= 0 <= upper),
+    }
+
+
 @app.get("/")
 def root():
-    return {"service": "LÚCIDA Science API", "version": "7.4", "status": "online"}
+    return {"service": "LÚCIDA Science API", "version": "7.5", "status": "online"}
 
 
 @app.get("/health")
@@ -195,6 +216,8 @@ async def train(
     calibration: Literal["auto", "none", "isotonic", "platt"] = Form("auto"),
     protected_feature: str = Form(""),
     xai_model: str = Form(""),
+    fairness_declaration: Literal["evaluate", "no_protected_attributes", "not_evaluated"] = Form("not_evaluated"),
+    threshold_approved: bool = Form(False),
 ):
     if folds not in (5, 10):
         raise HTTPException(422, "folds deve ser 5 ou 10")
@@ -368,6 +391,53 @@ async def train(
             "curve": [{"predicted": float(x), "observed": float(y)} for x, y in zip(mean_predicted, fraction_positive)],
         }
         recommended_holdout = _threshold_point(y_test, probability, best_threshold["threshold"])
+        robustness_scenarios = []
+        numeric_columns = X_test.select_dtypes(include=np.number).columns.tolist()
+        for severity in (.05, .10, .20):
+            perturbed = X_test.copy()
+            rng = np.random.default_rng(SEED + int(severity * 100))
+            for column in numeric_columns:
+                scale = float(X_dev[column].std()) or 1.0
+                perturbed[column] = perturbed[column] + rng.normal(0, scale * severity, len(perturbed))
+            perturbed_raw = final_pipeline.predict_proba(perturbed)[:, 1]
+            perturbed_probability, _ = _apply_calibrator(
+                selected_calibration, development_probability, development_y, perturbed_raw
+            )
+            point = _threshold_point(y_test, perturbed_probability, threshold)
+            perturbed_precision, perturbed_recall, _ = precision_recall_curve(y_test, perturbed_probability)
+            robustness_scenarios.append({
+                "scenario": "numeric_noise",
+                "severity": severity,
+                **point,
+                "auc_pr": float(auc(perturbed_recall, perturbed_precision)),
+                "f1_degradation": float(holdout["f1"] - point["f1"]),
+            })
+        missing = X_test.copy()
+        missing_rng = np.random.default_rng(SEED + 99)
+        missing_mask = missing_rng.random(missing.shape) < .10
+        missing = missing.mask(missing_mask)
+        missing_raw = final_pipeline.predict_proba(missing)[:, 1]
+        missing_probability, _ = _apply_calibrator(
+            selected_calibration, development_probability, development_y, missing_raw
+        )
+        missing_point = _threshold_point(y_test, missing_probability, threshold)
+        missing_precision, missing_recall, _ = precision_recall_curve(y_test, missing_probability)
+        robustness_scenarios.append({
+            "scenario": "missing_values",
+            "severity": .10,
+            **missing_point,
+            "auc_pr": float(auc(missing_recall, missing_precision)),
+            "f1_degradation": float(holdout["f1"] - missing_point["f1"]),
+        })
+        worst_degradation = max(0.0, max(item["f1_degradation"] for item in robustness_scenarios))
+        robustness = {
+            "source": "science-api",
+            "status": "scientific",
+            "baseline_f1": holdout["f1"],
+            "worst_f1_degradation": worst_degradation,
+            "stability_score": float(max(0, 1 - worst_degradation)),
+            "scenarios": robustness_scenarios,
+        }
         results.append({
             "algorithm": algorithm,
             "seconds": float(time.perf_counter() - started),
@@ -385,13 +455,37 @@ async def train(
                 "holdout_at_recommended_threshold": recommended_holdout,
             },
             "fairness": fairness,
+            "robustness": robustness,
         })
         fitted_artifacts[algorithm] = {
             "pipeline": final_pipeline,
             "X_dev": X_dev,
             "X_test": X_test,
+            "probability": probability,
+            "recommended_threshold": best_threshold["threshold"],
+            "selected_calibration": selected_calibration,
         }
     champion = max(results, key=lambda result: result["auc_pr"]["mean"] + result["f1"]["mean"])["algorithm"]
+    champion_probability = fitted_artifacts[champion]["probability"]
+    champion_threshold = fitted_artifacts[champion]["recommended_threshold"]
+    statistical_comparison = []
+    for result in results:
+        comparison = _paired_f1_comparison(
+            y_test,
+            champion_probability,
+            fitted_artifacts[result["algorithm"]]["probability"],
+            champion_threshold,
+            fitted_artifacts[result["algorithm"]]["recommended_threshold"],
+        )
+        statistical_comparison.append({
+            "champion": champion,
+            "candidate": result["algorithm"],
+            **comparison,
+        })
+    non_inferior_models = [
+        comparison["candidate"] for comparison in statistical_comparison
+        if comparison["statistical_tie"] or comparison["candidate"] == champion
+    ]
     explanation_model = xai_model if xai_model in fitted_artifacts else champion
     explanation_artifact = fitted_artifacts[explanation_model]
     explanation_pipeline = explanation_artifact["pipeline"]
@@ -442,7 +536,7 @@ async def train(
         except Exception:
             continue
     return {
-        "schema_version": "7.4",
+        "schema_version": "7.5",
         "experiment_id": str(uuid.uuid4()),
         "dataset_sha256": hashlib.sha256(raw).hexdigest(),
         "random_seed": SEED,
@@ -469,12 +563,46 @@ async def train(
         },
         "results": results,
         "champion": champion,
+        "statistical_comparison": {
+            "method": "paired_bootstrap_400_resamples",
+            "comparisons": statistical_comparison,
+            "non_inferior_models": non_inferior_models,
+            "deployment_preference": champion if champion in non_inferior_models else non_inferior_models[0],
+        },
+        "governance": {
+            "fairness_declaration": fairness_declaration,
+            "protected_feature": protected_feature or None,
+            "threshold_approved": threshold_approved,
+            "approved_threshold": threshold if threshold_approved else None,
+            "approval_timestamp": pd.Timestamp.utcnow().isoformat() if threshold_approved else None,
+        },
+        "model_card": {
+            "model": champion,
+            "status": "candidate",
+            "intended_use": "Binary classification decision support under human oversight.",
+            "dataset_sha256": hashlib.sha256(raw).hexdigest(),
+            "positive_class": positive_class,
+            "validation": validation,
+            "limitations": [
+                "External and temporal generalisation require separate evidence.",
+                "Fairness conclusions require contextual review and adequate group sizes.",
+                "Predictions must not replace accountable human judgement.",
+            ],
+            "deployment_readiness": {
+                "holdout_locked": True,
+                "threshold_approved": threshold_approved,
+                "fairness_declared": fairness_declaration != "not_evaluated",
+                "robustness_scientific": True,
+            },
+        },
         "scientific_protocol": {
             "holdout_locked": True,
             "calibration_selection": "cross_fitted_out_of_fold_development",
             "threshold_selection": "cross_fitted_out_of_fold_development",
             "holdout_used_for_selection": False,
             "confidence_intervals": "bootstrap_95_percent_400_resamples",
+            "robustness": "numeric_noise_and_missingness_stress_tests",
+            "model_comparison": "paired_bootstrap_holdout_f1",
         },
         "explainability": {
             "source": "science-api",
