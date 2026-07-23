@@ -1,33 +1,45 @@
-"""Scientific training service for LÚCIDA Explainable AI Studio."""
 from __future__ import annotations
 
 import hashlib
-import io
+import json
 import platform
 import time
 import uuid
 from typing import Literal
 
+import lightgbm
 import numpy as np
 import pandas as pd
 import sklearn
-import lightgbm
 import xgboost
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline
+from imblearn.under_sampling import RandomUnderSampler
 from lightgbm import LGBMClassifier
-from pydantic import BaseModel
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import average_precision_score, confusion_matrix, f1_score, precision_recall_curve, recall_score, roc_auc_score, roc_curve
-from sklearn.model_selection import StratifiedKFold, TimeSeriesSplit, train_test_split
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, StandardScaler
+from sklearn.metrics import (
+    auc,
+    confusion_matrix,
+    f1_score,
+    precision_recall_curve,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
+)
+from sklearn.model_selection import StratifiedKFold, TimeSeriesSplit
+from sklearn.pipeline import Pipeline as SkPipeline
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, OrdinalEncoder, StandardScaler
+from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
 
-app = FastAPI(title="LÚCIDA Science API", version="1.0.0")
+SEED = 42
+app = FastAPI(title="LÚCIDA Science API", version="7.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -35,51 +47,76 @@ app.add_middleware(
         "http://localhost:5173",
         "https://explainable-ai-studio.pedrojoao950.chatgpt.site",
     ],
-    allow_methods=["GET", "POST"],
+    allow_credentials=True,
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-class Health(BaseModel):
-    status: str
-    engine: str
-    algorithms: list[str]
-
-
-def _models(class_weight: str | None) -> dict[str, object]:
-    return {
-        "Regressão Logística": LogisticRegression(max_iter=2000, class_weight=class_weight, random_state=42),
-        "Random Forest": RandomForestClassifier(n_estimators=250, class_weight=class_weight, n_jobs=-1, random_state=42),
-        "Gradient Boosting": GradientBoostingClassifier(n_estimators=150, random_state=42),
-        "XGBoost": XGBClassifier(n_estimators=200, learning_rate=.05, max_depth=5, eval_metric="logloss", n_jobs=-1, random_state=42),
-        "LightGBM": LGBMClassifier(n_estimators=200, learning_rate=.05, class_weight=class_weight, verbosity=-1, n_jobs=-1, random_state=42),
-    }
-
-
-def _preprocessor(frame: pd.DataFrame, encoding: str, scaling: str) -> ColumnTransformer:
+def _preprocessor(
+    frame: pd.DataFrame,
+    encoding: str,
+    scaling: str,
+    numeric_imputer: str,
+    categorical_imputer: str,
+) -> ColumnTransformer:
     numeric = frame.select_dtypes(include=np.number).columns.tolist()
-    categorical = frame.columns.difference(numeric).tolist()
-    numeric_steps: list[tuple[str, object]] = [("imputer", SimpleImputer(strategy="median"))]
-    if scaling == "standard":
-        numeric_steps.append(("scaler", StandardScaler()))
-    encoder = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1) if encoding == "ordinal" else OneHotEncoder(handle_unknown="ignore", sparse_output=False)
-    return ColumnTransformer([
-        ("numeric", Pipeline(numeric_steps), numeric),
-        ("categorical", Pipeline([("imputer", SimpleImputer(strategy="most_frequent")), ("encoder", encoder)]), categorical),
-    ], remainder="drop")
+    categorical = [column for column in frame.columns if column not in numeric]
+    scaler = (
+        StandardScaler()
+        if scaling == "standard"
+        else MinMaxScaler()
+        if scaling == "minmax"
+        else "passthrough"
+    )
+    number_pipe = SkPipeline(
+        [("imputer", SimpleImputer(strategy=numeric_imputer)), ("scaler", scaler)]
+    )
+    category_imputer = (
+        SimpleImputer(strategy="constant", fill_value="Ausente")
+        if categorical_imputer == "constant"
+        else SimpleImputer(strategy="most_frequent")
+    )
+    encoder = (
+        OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
+        if encoding == "ordinal"
+        else OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    )
+    category_pipe = SkPipeline([("imputer", category_imputer), ("encoder", encoder)])
+    return ColumnTransformer(
+        [("numeric", number_pipe, numeric), ("categorical", category_pipe, categorical)],
+        remainder="drop",
+    )
 
 
-def _binary_target(series: pd.Series) -> tuple[np.ndarray, list[str]]:
-    labels = series.astype(str).fillna("Ausente")
-    classes = sorted(labels.unique().tolist())
-    if len(classes) != 2:
-        raise HTTPException(422, "A Fase 6 suporta inicialmente classificação binária.")
-    return (labels == classes[1]).astype(int).to_numpy(), classes
+def _models(class_weight: bool, positive_weight: float):
+    weight = "balanced" if class_weight else None
+    return [
+        ("Regressão Logística", LogisticRegression(max_iter=2000, class_weight=weight, random_state=SEED)),
+        ("Random Forest", RandomForestClassifier(n_estimators=250, class_weight=weight, random_state=SEED, n_jobs=-1)),
+        ("Gradient Boosting", GradientBoostingClassifier(random_state=SEED)),
+        ("XGBoost", XGBClassifier(n_estimators=250, max_depth=5, learning_rate=.05, subsample=.9, colsample_bytree=.9, scale_pos_weight=positive_weight if class_weight else 1, random_state=SEED, n_jobs=-1)),
+        ("LightGBM", LGBMClassifier(n_estimators=250, learning_rate=.05, class_weight=weight, random_state=SEED, verbosity=-1, n_jobs=-1)),
+    ]
 
 
-@app.get("/health", response_model=Health)
-def health() -> Health:
-    return Health(status="ready", engine="python-scientific", algorithms=list(_models(None)))
+def _summary(values: list[float]) -> dict[str, float]:
+    return {"mean": float(np.mean(values)), "std": float(np.std(values))}
+
+
+def _points(first: np.ndarray, second: np.ndarray, limit: int = 120):
+    positions = np.unique(np.linspace(0, len(first) - 1, min(limit, len(first))).astype(int))
+    return [{"x": float(first[i]), "y": float(second[i])} for i in positions]
+
+
+@app.get("/")
+def root():
+    return {"service": "LÚCIDA Science API", "version": "7.2", "status": "online"}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
 @app.post("/v1/train")
@@ -88,66 +125,150 @@ async def train(
     target: str = Form(...),
     validation: Literal["stratified", "temporal"] = Form("stratified"),
     folds: int = Form(5),
-    date_column: str | None = Form(None),
+    date_column: str = Form(""),
     encoding: Literal["onehot", "ordinal"] = Form("onehot"),
-    scaling: Literal["standard", "none"] = Form("standard"),
-    imbalance: Literal["class_weight", "none"] = Form("class_weight"),
+    scaling: Literal["standard", "minmax", "none"] = Form("standard"),
+    numeric_imputer: Literal["median", "mean"] = Form("median"),
+    categorical_imputer: Literal["most_frequent", "constant"] = Form("most_frequent"),
+    imbalance: Literal["none", "class_weight", "smote", "undersampling"] = Form("class_weight"),
+    excluded_features: str = Form("[]"),
     threshold: float = Form(.5),
 ):
-    if not file.filename or not file.filename.lower().endswith(".csv"):
-        raise HTTPException(415, "Envie um ficheiro CSV.")
-    raw = await file.read()
-    if len(raw) > 25 * 1024 * 1024:
-        raise HTTPException(413, "O CSV excede 25 MB.")
+    if folds not in (5, 10):
+        raise HTTPException(422, "folds deve ser 5 ou 10")
     if not .05 <= threshold <= .95:
-        raise HTTPException(422, "O limiar deve estar entre 0.05 e 0.95.")
-    dataset_hash = hashlib.sha256(raw).hexdigest()
-    experiment_id = str(uuid.uuid4())
+        raise HTTPException(422, "threshold deve estar entre 0.05 e 0.95")
+    raw = await file.read()
     try:
-        frame = pd.read_csv(io.BytesIO(raw), sep=None, engine="python")
-    except Exception as exc:
-        raise HTTPException(422, f"CSV inválido: {exc}") from exc
+        frame = pd.read_csv(pd.io.common.BytesIO(raw), sep=None, engine="python")
+        excluded = json.loads(excluded_features)
+    except Exception as error:
+        raise HTTPException(422, f"CSV ou configuração inválida: {error}") from error
     if target not in frame:
-        raise HTTPException(422, "Coluna-alvo não encontrada.")
+        raise HTTPException(422, "Coluna-alvo não encontrada")
+    if not isinstance(excluded, list):
+        raise HTTPException(422, "excluded_features deve ser uma lista JSON")
     frame = frame.dropna(subset=[target]).drop_duplicates().reset_index(drop=True)
-    if len(frame) < max(30, folds * 4):
-        raise HTTPException(422, "Observações insuficientes para validação robusta.")
     if validation == "temporal":
         if not date_column or date_column not in frame:
-            raise HTTPException(422, "Selecione uma coluna temporal válida.")
+            raise HTTPException(422, "Selecione uma coluna temporal válida")
         frame[date_column] = pd.to_datetime(frame[date_column], errors="coerce")
-        frame = frame.dropna(subset=[date_column]).sort_values(date_column)
-    y, classes = _binary_target(frame[target])
-    drop = [target] + ([date_column] if date_column else [])
-    X = frame.drop(columns=drop, errors="ignore")
-    if validation == "temporal":
-        cut = max(1, int(len(X) * .8)); X_dev, X_test = X.iloc[:cut], X.iloc[cut:]; y_dev, y_test = y[:cut], y[cut:]
-        splitter = TimeSeriesSplit(n_splits=folds)
-    else:
-        X_dev, X_test, y_dev, y_test = train_test_split(X, y, test_size=.2, stratify=y, random_state=42)
-        splitter = StratifiedKFold(n_splits=folds, shuffle=True, random_state=42)
-    class_weight = "balanced" if imbalance == "class_weight" else None
+        frame = frame.dropna(subset=[date_column]).sort_values(date_column).reset_index(drop=True)
+    excluded = [str(column) for column in excluded if column in frame and column != target]
+    feature_columns = [column for column in frame.columns if column not in {target, *excluded}]
+    if date_column in feature_columns:
+        feature_columns.remove(date_column)
+    if not feature_columns:
+        raise HTTPException(422, "Nenhuma variável explicativa disponível")
+    X = frame[feature_columns]
+    labels = frame[target].astype(str)
+    classes = labels.value_counts().index.tolist()
+    if len(classes) != 2:
+        raise HTTPException(422, "A fase 7.2 suporta classificação binária")
+    positive_class = str(classes[-1])
+    y = (labels == positive_class).astype(int)
+    cut = int(len(frame) * .8)
+    if cut < folds or len(frame) - cut < 2:
+        raise HTTPException(422, "Dataset insuficiente para validação e holdout")
+    X_dev, X_test, y_dev, y_test = X.iloc[:cut], X.iloc[cut:], y.iloc[:cut], y.iloc[cut:]
+    negative, positive = np.bincount(y_dev, minlength=2)
+    positive_weight = float(negative / max(1, positive))
+    splitter = (
+        TimeSeriesSplit(n_splits=folds)
+        if validation == "temporal"
+        else StratifiedKFold(n_splits=folds, shuffle=True, random_state=SEED)
+    )
+    split_iterator = splitter.split(X_dev, y_dev)
+    splits = list(split_iterator)
     results = []
-    for name, estimator in _models(class_weight).items():
+    for algorithm, estimator in _models(imbalance == "class_weight", positive_weight):
         started = time.perf_counter()
         fold_metrics = []
-        for fold_number, (train_index, test_index) in enumerate(splitter.split(X_dev, y_dev), 1):
-            pipeline = Pipeline([("prepare", _preprocessor(X_dev.iloc[train_index], encoding, scaling)), ("model", estimator)])
-            pipeline.fit(X_dev.iloc[train_index], y_dev[train_index])
-            probability = pipeline.predict_proba(X_dev.iloc[test_index])[:, 1]
+        for fold_index, (train_index, valid_index) in enumerate(splits, 1):
+            steps = [("preprocess", _preprocessor(X_dev, encoding, scaling, numeric_imputer, categorical_imputer))]
+            if imbalance == "smote":
+                steps.append(("balance", SMOTE(random_state=SEED)))
+            elif imbalance == "undersampling":
+                steps.append(("balance", RandomUnderSampler(random_state=SEED)))
+            steps.append(("model", estimator))
+            pipeline = Pipeline(steps)
+            fit_options = {}
+            if imbalance == "class_weight" and algorithm == "Gradient Boosting":
+                fit_options["model__sample_weight"] = compute_sample_weight("balanced", y_dev.iloc[train_index])
+            pipeline.fit(X_dev.iloc[train_index], y_dev.iloc[train_index], **fit_options)
+            probability = pipeline.predict_proba(X_dev.iloc[valid_index])[:, 1]
             prediction = (probability >= threshold).astype(int)
             fold_metrics.append({
-                "fold": fold_number,
-                "recall": recall_score(y_dev[test_index], prediction, zero_division=0),
-                "f1": f1_score(y_dev[test_index], prediction, zero_division=0),
-                "auc_roc": roc_auc_score(y_dev[test_index], probability),
-                "auc_pr": average_precision_score(y_dev[test_index], probability),
+                "fold": fold_index,
+                "recall": float(recall_score(y_dev.iloc[valid_index], prediction, zero_division=0)),
+                "f1": float(f1_score(y_dev.iloc[valid_index], prediction, zero_division=0)),
+                "auc_roc": float(roc_auc_score(y_dev.iloc[valid_index], probability)),
+                "auc_pr": float(auc(*reversed(precision_recall_curve(y_dev.iloc[valid_index], probability)[:2]))),
             })
-        final_pipeline = Pipeline([("prepare", _preprocessor(X_dev, encoding, scaling)), ("model", estimator)])
-        final_pipeline.fit(X_dev, y_dev); test_probability = final_pipeline.predict_proba(X_test)[:, 1]; test_prediction = (test_probability >= threshold).astype(int)
-        tn, fp, fn, tp = confusion_matrix(y_test, test_prediction, labels=[0,1]).ravel()
-        fpr, tpr, _ = roc_curve(y_test, test_probability); precision, recall, _ = precision_recall_curve(y_test, test_probability)
-        summary = {key: {"mean": round(float(np.mean([fold[key] for fold in fold_metrics])), 5), "std": round(float(np.std([fold[key] for fold in fold_metrics])), 5)} for key in ("recall","f1","auc_roc","auc_pr")}
-        results.append({"algorithm": name, "seconds": round(time.perf_counter()-started, 3), **summary, "fold_metrics": fold_metrics, "holdout": {"rows": len(X_test), "recall": round(recall_score(y_test,test_prediction,zero_division=0),5), "f1": round(f1_score(y_test,test_prediction,zero_division=0),5), "auc_roc": round(roc_auc_score(y_test,test_probability),5), "auc_pr": round(average_precision_score(y_test,test_probability),5), "confusion": {"tn":int(tn),"fp":int(fp),"fn":int(fn),"tp":int(tp)}, "roc_curve": [{"x":round(float(x),4),"y":round(float(y),4)} for x,y in zip(fpr[::max(1,len(fpr)//20)],tpr[::max(1,len(tpr)//20)])], "pr_curve": [{"x":round(float(x),4),"y":round(float(y),4)} for x,y in zip(recall[::max(1,len(recall)//20)],precision[::max(1,len(precision)//20)])]}})
-    champion = max(results, key=lambda result: result["auc_pr"]["mean"] + result["f1"]["mean"])
-    return {"schema_version":"7.1", "mode": "scientific", "experiment_id":experiment_id, "dataset_sha256":dataset_hash, "random_seed":42, "runtime":{"python":platform.python_version(),"numpy":np.__version__,"pandas":pd.__version__,"scikit_learn":sklearn.__version__,"xgboost":xgboost.__version__,"lightgbm":lightgbm.__version__}, "rows": len(frame), "development_rows": len(X_dev), "test_rows": len(X_test), "features": X.shape[1], "classes": classes, "positive_class":classes[1], "validation": validation, "folds": folds, "threshold":threshold, "results": results, "champion": champion["algorithm"], "champion_diagnostics": champion["holdout"]}
+        final_steps = [("preprocess", _preprocessor(X_dev, encoding, scaling, numeric_imputer, categorical_imputer))]
+        if imbalance == "smote":
+            final_steps.append(("balance", SMOTE(random_state=SEED)))
+        elif imbalance == "undersampling":
+            final_steps.append(("balance", RandomUnderSampler(random_state=SEED)))
+        final_steps.append(("model", estimator))
+        final_fit_options = {}
+        if imbalance == "class_weight" and algorithm == "Gradient Boosting":
+            final_fit_options["model__sample_weight"] = compute_sample_weight("balanced", y_dev)
+        final_pipeline = Pipeline(final_steps).fit(X_dev, y_dev, **final_fit_options)
+        probability = final_pipeline.predict_proba(X_test)[:, 1]
+        prediction = (probability >= threshold).astype(int)
+        tn, fp, fn, tp = confusion_matrix(y_test, prediction, labels=[0, 1]).ravel()
+        fpr_curve, tpr_curve, _ = roc_curve(y_test, probability)
+        precision_curve, recall_curve, _ = precision_recall_curve(y_test, probability)
+        holdout = {
+            "rows": len(y_test),
+            "recall": float(recall_score(y_test, prediction, zero_division=0)),
+            "precision": float(precision_score(y_test, prediction, zero_division=0)),
+            "f1": float(f1_score(y_test, prediction, zero_division=0)),
+            "auc_roc": float(roc_auc_score(y_test, probability)),
+            "auc_pr": float(auc(recall_curve, precision_curve)),
+            "specificity": float(tn / max(1, tn + fp)),
+            "false_positive_rate": float(fp / max(1, fp + tn)),
+            "false_negative_rate": float(fn / max(1, fn + tp)),
+            "predicted_positive": int(tp + fp),
+            "confusion": {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},
+            "roc_curve": _points(fpr_curve, tpr_curve),
+            "pr_curve": _points(recall_curve, precision_curve),
+        }
+        results.append({
+            "algorithm": algorithm,
+            "seconds": float(time.perf_counter() - started),
+            **{metric: _summary([fold[metric] for fold in fold_metrics]) for metric in ("recall", "f1", "auc_roc", "auc_pr")},
+            "fold_metrics": fold_metrics,
+            "holdout": holdout,
+        })
+    champion = max(results, key=lambda result: result["auc_pr"]["mean"] + result["f1"]["mean"])["algorithm"]
+    return {
+        "schema_version": "7.2",
+        "experiment_id": str(uuid.uuid4()),
+        "dataset_sha256": hashlib.sha256(raw).hexdigest(),
+        "random_seed": SEED,
+        "runtime": {
+            "python": platform.python_version(),
+            "scikit_learn": sklearn.__version__,
+            "xgboost": xgboost.__version__,
+            "lightgbm": lightgbm.__version__,
+        },
+        "positive_class": positive_class,
+        "threshold": threshold,
+        "validation": validation,
+        "development_rows": len(X_dev),
+        "test_rows": len(X_test),
+        "pipeline": {
+            "numeric_imputer": numeric_imputer,
+            "categorical_imputer": categorical_imputer,
+            "encoding": encoding,
+            "scaling": scaling,
+            "imbalance": imbalance,
+            "excluded_features": excluded,
+            "features_used": feature_columns,
+            "date_column": date_column or None,
+        },
+        "results": results,
+        "champion": champion,
+    }
