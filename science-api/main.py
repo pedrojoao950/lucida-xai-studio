@@ -49,7 +49,7 @@ from xgboost import XGBClassifier
 
 SEED = 42
 MODEL_CACHE: dict[str, dict] = {}
-app = FastAPI(title="LÚCIDA Science API", version="7.7")
+app = FastAPI(title="LÚCIDA Science API", version="7.8")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -194,7 +194,7 @@ def _paired_f1_comparison(y_true, champion_probability, candidate_probability, c
 
 @app.get("/")
 def root():
-    return {"service": "LÚCIDA Science API", "version": "7.7", "status": "online"}
+    return {"service": "LÚCIDA Science API", "version": "7.8", "status": "online"}
 
 
 @app.get("/health")
@@ -586,6 +586,12 @@ async def train(
         "positive_class": positive_class,
         "reference": X_dev.copy(),
         "baseline_probability": champion_probability_array,
+        "xai": {
+            "model": xai_model if xai_model in fitted_artifacts else champion,
+            "pipeline": fitted_artifacts[xai_model if xai_model in fitted_artifacts else champion]["pipeline"],
+            "X_dev": fitted_artifacts[xai_model if xai_model in fitted_artifacts else champion]["X_dev"].copy(),
+            "X_test": fitted_artifacts[xai_model if xai_model in fitted_artifacts else champion]["X_test"].copy(),
+        },
         "created_at": pd.Timestamp.utcnow().isoformat(),
     }
     return {
@@ -733,6 +739,116 @@ def _cached_probability(artifact: dict, frame: pd.DataFrame):
     if method == "platt":
         return calibrator.predict_proba(raw_probability.reshape(-1, 1))[:, 1]
     return raw_probability
+
+
+def _dense(values):
+    return values.toarray() if hasattr(values, "toarray") else np.asarray(values)
+
+
+def _calculate_explainability(artifact: dict, experiment_id: str):
+    xai_artifact = artifact.get("xai")
+    if not xai_artifact:
+        raise HTTPException(409, "A experiência não contém um artefacto XAI; reexecute o treino.")
+    pipeline = xai_artifact["pipeline"]
+    preprocess = pipeline.named_steps["preprocess"]
+    model = pipeline.named_steps["model"]
+    X_dev, X_test = xai_artifact["X_dev"], xai_artifact["X_test"]
+    transformed_dev = _dense(preprocess.transform(X_dev))
+    transformed_test = _dense(preprocess.transform(X_test))
+    if not len(transformed_test):
+        raise HTTPException(409, "O holdout não contém observações para explicar.")
+    feature_names = [str(name) for name in preprocess.get_feature_names_out()]
+    background = transformed_dev[: min(100, len(transformed_dev))]
+    explained = transformed_test[: min(40, len(transformed_test))]
+    errors = []
+
+    try:
+        if xai_artifact["model"] == "Regressão Logística":
+            shap_values = shap.LinearExplainer(model, background)(explained).values
+        else:
+            shap_values = shap.TreeExplainer(model)(explained).values
+        if shap_values.ndim == 3:
+            shap_values = shap_values[:, :, -1]
+        importance = np.mean(np.abs(shap_values), axis=0)
+        shap_result = [
+            {
+                "feature": feature_names[index],
+                "display_feature": _display_feature(feature_names[index]),
+                "mean_abs_shap": float(importance[index]),
+            }
+            for index in np.argsort(importance)[::-1][:12]
+        ]
+    except Exception as error:
+        shap_result = []
+        errors.append({"method": "SHAP", "reason": str(error)[:240]})
+
+    try:
+        lime_explainer = LimeTabularExplainer(
+            background,
+            feature_names=feature_names,
+            class_names=["negative", artifact["positive_class"]],
+            mode="classification",
+            random_state=SEED,
+        )
+        explanation = lime_explainer.explain_instance(
+            explained[0], model.predict_proba, num_features=min(10, len(feature_names))
+        )
+        lime_result = [
+            {
+                "condition": condition,
+                "display_condition": _display_feature(condition),
+                "weight": float(weight),
+                "scale": "transformed",
+            }
+            for condition, weight in explanation.as_list()
+        ]
+    except Exception as error:
+        lime_result = []
+        errors.append({"method": "LIME", "reason": str(error)[:240]})
+
+    pdp_result = []
+    for feature in X_dev.select_dtypes(include=np.number).columns[:5]:
+        try:
+            dependence = partial_dependence(pipeline, X_dev, [feature], grid_resolution=12)
+            pdp_result.append({
+                "feature": str(feature),
+                "points": [
+                    {"value": float(x), "prediction": float(y)}
+                    for x, y in zip(dependence["grid_values"][0], dependence["average"][0])
+                ],
+            })
+        except Exception as error:
+            errors.append({"method": f"PDP:{feature}", "reason": str(error)[:240]})
+
+    completed = bool(shap_result) and bool(lime_result) and bool(pdp_result)
+    return {
+        "source": "science-api",
+        "status": "scientific" if completed else "partial",
+        "model": xai_artifact["model"],
+        "experiment_id": experiment_id,
+        "model_version": artifact["model_version"],
+        "artifact_sha256": artifact["artifact_sha256"],
+        "shap_global": shap_result,
+        "lime_local": {
+            "holdout_row": 0,
+            "features": lime_result,
+            "raw_instance": {
+                str(key): (None if pd.isna(value) else value.item() if hasattr(value, "item") else value)
+                for key, value in X_test.iloc[0].to_dict().items()
+            },
+            "note": "Condições LIME usam a escala transformada; valores originais constam de raw_instance.",
+        },
+        "partial_dependence": pdp_result,
+        "errors": errors,
+    }
+
+
+@app.post("/v1/explain/{experiment_id}")
+def explain(experiment_id: str):
+    artifact = MODEL_CACHE.get(experiment_id)
+    if not artifact:
+        raise HTTPException(404, "Artefacto não está carregado neste processo; reexecute o treino.")
+    return _calculate_explainability(artifact, experiment_id)
 
 
 @app.post("/v1/predict/{experiment_id}")
