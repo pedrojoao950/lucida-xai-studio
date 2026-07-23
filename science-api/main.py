@@ -1,12 +1,18 @@
 """Scientific training service for LÚCIDA Explainable AI Studio."""
 from __future__ import annotations
 
+import hashlib
 import io
+import platform
 import time
+import uuid
 from typing import Literal
 
 import numpy as np
 import pandas as pd
+import sklearn
+import lightgbm
+import xgboost
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from lightgbm import LGBMClassifier
@@ -86,12 +92,17 @@ async def train(
     encoding: Literal["onehot", "ordinal"] = Form("onehot"),
     scaling: Literal["standard", "none"] = Form("standard"),
     imbalance: Literal["class_weight", "none"] = Form("class_weight"),
+    threshold: float = Form(.5),
 ):
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(415, "Envie um ficheiro CSV.")
     raw = await file.read()
     if len(raw) > 25 * 1024 * 1024:
         raise HTTPException(413, "O CSV excede 25 MB.")
+    if not .05 <= threshold <= .95:
+        raise HTTPException(422, "O limiar deve estar entre 0.05 e 0.95.")
+    dataset_hash = hashlib.sha256(raw).hexdigest()
+    experiment_id = str(uuid.uuid4())
     try:
         frame = pd.read_csv(io.BytesIO(raw), sep=None, engine="python")
     except Exception as exc:
@@ -124,7 +135,7 @@ async def train(
             pipeline = Pipeline([("prepare", _preprocessor(X_dev.iloc[train_index], encoding, scaling)), ("model", estimator)])
             pipeline.fit(X_dev.iloc[train_index], y_dev[train_index])
             probability = pipeline.predict_proba(X_dev.iloc[test_index])[:, 1]
-            prediction = (probability >= .5).astype(int)
+            prediction = (probability >= threshold).astype(int)
             fold_metrics.append({
                 "fold": fold_number,
                 "recall": recall_score(y_dev[test_index], prediction, zero_division=0),
@@ -133,10 +144,10 @@ async def train(
                 "auc_pr": average_precision_score(y_dev[test_index], probability),
             })
         final_pipeline = Pipeline([("prepare", _preprocessor(X_dev, encoding, scaling)), ("model", estimator)])
-        final_pipeline.fit(X_dev, y_dev); test_probability = final_pipeline.predict_proba(X_test)[:, 1]; test_prediction = (test_probability >= .5).astype(int)
+        final_pipeline.fit(X_dev, y_dev); test_probability = final_pipeline.predict_proba(X_test)[:, 1]; test_prediction = (test_probability >= threshold).astype(int)
         tn, fp, fn, tp = confusion_matrix(y_test, test_prediction, labels=[0,1]).ravel()
         fpr, tpr, _ = roc_curve(y_test, test_probability); precision, recall, _ = precision_recall_curve(y_test, test_probability)
         summary = {key: {"mean": round(float(np.mean([fold[key] for fold in fold_metrics])), 5), "std": round(float(np.std([fold[key] for fold in fold_metrics])), 5)} for key in ("recall","f1","auc_roc","auc_pr")}
         results.append({"algorithm": name, "seconds": round(time.perf_counter()-started, 3), **summary, "fold_metrics": fold_metrics, "holdout": {"rows": len(X_test), "recall": round(recall_score(y_test,test_prediction,zero_division=0),5), "f1": round(f1_score(y_test,test_prediction,zero_division=0),5), "auc_roc": round(roc_auc_score(y_test,test_probability),5), "auc_pr": round(average_precision_score(y_test,test_probability),5), "confusion": {"tn":int(tn),"fp":int(fp),"fn":int(fn),"tp":int(tp)}, "roc_curve": [{"x":round(float(x),4),"y":round(float(y),4)} for x,y in zip(fpr[::max(1,len(fpr)//20)],tpr[::max(1,len(tpr)//20)])], "pr_curve": [{"x":round(float(x),4),"y":round(float(y),4)} for x,y in zip(recall[::max(1,len(recall)//20)],precision[::max(1,len(precision)//20)])]}})
     champion = max(results, key=lambda result: result["auc_pr"]["mean"] + result["f1"]["mean"])
-    return {"mode": "scientific", "rows": len(frame), "development_rows": len(X_dev), "test_rows": len(X_test), "features": X.shape[1], "classes": classes, "validation": validation, "folds": folds, "results": results, "champion": champion["algorithm"], "champion_diagnostics": champion["holdout"]}
+    return {"schema_version":"7.1", "mode": "scientific", "experiment_id":experiment_id, "dataset_sha256":dataset_hash, "random_seed":42, "runtime":{"python":platform.python_version(),"numpy":np.__version__,"pandas":pd.__version__,"scikit_learn":sklearn.__version__,"xgboost":xgboost.__version__,"lightgbm":lightgbm.__version__}, "rows": len(frame), "development_rows": len(X_dev), "test_rows": len(X_test), "features": X.shape[1], "classes": classes, "positive_class":classes[1], "validation": validation, "folds": folds, "threshold":threshold, "results": results, "champion": champion["algorithm"], "champion_diagnostics": champion["holdout"]}
