@@ -46,7 +46,7 @@ from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
 
 SEED = 42
-app = FastAPI(title="LÚCIDA Science API", version="7.3")
+app = FastAPI(title="LÚCIDA Science API", version="7.4")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -116,9 +116,61 @@ def _points(first: np.ndarray, second: np.ndarray, limit: int = 120):
     return [{"x": float(first[i]), "y": float(second[i])} for i in positions]
 
 
+def _apply_calibrator(method: str, train_probability, train_y, probability):
+    if method == "none":
+        return np.asarray(probability), None
+    if method == "isotonic":
+        fitted = IsotonicRegression(out_of_bounds="clip").fit(train_probability, train_y)
+        return np.asarray(fitted.predict(probability)), fitted
+    fitted = LogisticRegression(random_state=SEED).fit(np.asarray(train_probability).reshape(-1, 1), train_y)
+    return fitted.predict_proba(np.asarray(probability).reshape(-1, 1))[:, 1], fitted
+
+
+def _threshold_point(y_true, probability, candidate: float):
+    prediction = (np.asarray(probability) >= candidate).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, prediction, labels=[0, 1]).ravel()
+    return {
+        "threshold": float(candidate),
+        "recall": float(recall_score(y_true, prediction, zero_division=0)),
+        "precision": float(precision_score(y_true, prediction, zero_division=0)),
+        "f1": float(f1_score(y_true, prediction, zero_division=0)),
+        "specificity": float(tn / max(1, tn + fp)),
+        "false_positive_rate": float(fp / max(1, fp + tn)),
+        "false_negative_rate": float(fn / max(1, fn + tp)),
+        "predicted_positive": int(tp + fp),
+    }
+
+
+def _bootstrap_intervals(y_true, probability, threshold: float, samples: int = 400):
+    truth = np.asarray(y_true)
+    probability = np.asarray(probability)
+    rng = np.random.default_rng(SEED)
+    values = {metric: [] for metric in ("recall", "precision", "f1", "auc_roc", "auc_pr")}
+    for _ in range(samples):
+        index = rng.integers(0, len(truth), len(truth))
+        sampled_y, sampled_probability = truth[index], probability[index]
+        if len(np.unique(sampled_y)) < 2:
+            continue
+        sampled_prediction = (sampled_probability >= threshold).astype(int)
+        precision_curve, recall_curve, _ = precision_recall_curve(sampled_y, sampled_probability)
+        values["recall"].append(recall_score(sampled_y, sampled_prediction, zero_division=0))
+        values["precision"].append(precision_score(sampled_y, sampled_prediction, zero_division=0))
+        values["f1"].append(f1_score(sampled_y, sampled_prediction, zero_division=0))
+        values["auc_roc"].append(roc_auc_score(sampled_y, sampled_probability))
+        values["auc_pr"].append(auc(recall_curve, precision_curve))
+    return {
+        metric: {"lower": float(np.quantile(scores, .025)), "upper": float(np.quantile(scores, .975))}
+        for metric, scores in values.items() if scores
+    }
+
+
+def _display_feature(name: str):
+    return name.replace("numeric__", "").replace("categorical__", "").replace("_", " ")
+
+
 @app.get("/")
 def root():
-    return {"service": "LÚCIDA Science API", "version": "7.3", "status": "online"}
+    return {"service": "LÚCIDA Science API", "version": "7.4", "status": "online"}
 
 
 @app.get("/health")
@@ -140,8 +192,9 @@ async def train(
     imbalance: Literal["none", "class_weight", "smote", "undersampling"] = Form("class_weight"),
     excluded_features: str = Form("[]"),
     threshold: float = Form(.5),
-    calibration: Literal["isotonic", "platt"] = Form("isotonic"),
+    calibration: Literal["auto", "none", "isotonic", "platt"] = Form("auto"),
     protected_feature: str = Form(""),
+    xai_model: str = Form(""),
 ):
     if folds not in (5, 10):
         raise HTTPException(422, "folds deve ser 5 ou 10")
@@ -229,36 +282,37 @@ async def train(
         final_pipeline = Pipeline(final_steps).fit(X_dev, y_dev, **final_fit_options)
         raw_probability = final_pipeline.predict_proba(X_test)[:, 1]
         calibration_mask = np.isfinite(oof_probability)
-        if calibration == "isotonic":
-            calibrator = IsotonicRegression(out_of_bounds="clip").fit(
-                oof_probability[calibration_mask], y_dev.iloc[np.where(calibration_mask)[0]]
-            )
-            probability = np.asarray(calibrator.predict(raw_probability))
-        else:
-            calibrator = LogisticRegression(random_state=SEED).fit(
-                oof_probability[calibration_mask].reshape(-1, 1),
-                y_dev.iloc[np.where(calibration_mask)[0]],
-            )
-            probability = calibrator.predict_proba(raw_probability.reshape(-1, 1))[:, 1]
+        development_probability = oof_probability[calibration_mask]
+        development_y = y_dev.iloc[np.where(calibration_mask)[0]].to_numpy()
+        calibration_splits = StratifiedKFold(n_splits=min(5, int(np.bincount(development_y).min())), shuffle=True, random_state=SEED)
+        calibrated_oof = {"none": development_probability.copy()}
+        selection_scores = {"none": float(brier_score_loss(development_y, development_probability))}
+        for method in ("isotonic", "platt"):
+            candidate_probability = np.full(len(development_y), np.nan)
+            for calibration_train, calibration_valid in calibration_splits.split(development_probability, development_y):
+                candidate_probability[calibration_valid], _ = _apply_calibrator(
+                    method,
+                    development_probability[calibration_train],
+                    development_y[calibration_train],
+                    development_probability[calibration_valid],
+                )
+            calibrated_oof[method] = candidate_probability
+            selection_scores[method] = float(brier_score_loss(development_y, candidate_probability))
+        selected_calibration = min(selection_scores, key=selection_scores.get) if calibration == "auto" else calibration
+        probability, _ = _apply_calibrator(
+            selected_calibration, development_probability, development_y, raw_probability
+        )
+        development_decision_probability = calibrated_oof[selected_calibration]
+        development_threshold_curve = [
+            _threshold_point(development_y, development_decision_probability, candidate)
+            for candidate in np.linspace(.05, .95, 19)
+        ]
+        best_threshold = max(development_threshold_curve, key=lambda point: point["f1"])
         prediction = (probability >= threshold).astype(int)
         tn, fp, fn, tp = confusion_matrix(y_test, prediction, labels=[0, 1]).ravel()
         fpr_curve, tpr_curve, _ = roc_curve(y_test, probability)
         precision_curve, recall_curve, _ = precision_recall_curve(y_test, probability)
         fraction_positive, mean_predicted = calibration_curve(y_test, probability, n_bins=8, strategy="quantile")
-        threshold_curve = []
-        for candidate in np.linspace(.05, .95, 19):
-            candidate_prediction = (probability >= candidate).astype(int)
-            ctn, cfp, cfn, ctp = confusion_matrix(y_test, candidate_prediction, labels=[0, 1]).ravel()
-            threshold_curve.append({
-                "threshold": float(candidate),
-                "recall": float(recall_score(y_test, candidate_prediction, zero_division=0)),
-                "precision": float(precision_score(y_test, candidate_prediction, zero_division=0)),
-                "f1": float(f1_score(y_test, candidate_prediction, zero_division=0)),
-                "specificity": float(ctn / max(1, ctn + cfp)),
-                "false_positive_rate": float(cfp / max(1, cfp + ctn)),
-                "false_negative_rate": float(cfn / max(1, cfn + ctp)),
-                "predicted_positive": int(ctp + cfp),
-            })
         fairness = None
         if protected_feature and protected_feature in X_test:
             fairness_groups = []
@@ -299,16 +353,21 @@ async def train(
             "confusion": {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},
             "roc_curve": _points(fpr_curve, tpr_curve),
             "pr_curve": _points(recall_curve, precision_curve),
+            "confidence_intervals_95": _bootstrap_intervals(y_test, probability, threshold),
         }
         calibration_result = {
-            "method": calibration,
+            "method_requested": calibration,
+            "method_selected": selected_calibration,
+            "selection_source": "cross_fitted_out_of_fold_development",
+            "selection_brier": selection_scores,
+            "accepted": selected_calibration != "none",
             "brier_before": float(brier_score_loss(y_test, raw_probability)),
             "brier_after": float(brier_score_loss(y_test, probability)),
             "log_loss_before": float(log_loss(y_test, np.clip(raw_probability, 1e-7, 1 - 1e-7))),
             "log_loss_after": float(log_loss(y_test, np.clip(probability, 1e-7, 1 - 1e-7))),
             "curve": [{"predicted": float(x), "observed": float(y)} for x, y in zip(mean_predicted, fraction_positive)],
         }
-        best_threshold = max(threshold_curve, key=lambda point: point["f1"])
+        recommended_holdout = _threshold_point(y_test, probability, best_threshold["threshold"])
         results.append({
             "algorithm": algorithm,
             "seconds": float(time.perf_counter() - started),
@@ -319,8 +378,11 @@ async def train(
             "threshold_analysis": {
                 "active_threshold": threshold,
                 "recommended_threshold": best_threshold["threshold"],
-                "criterion": "maximum_holdout_f1",
-                "curve": threshold_curve,
+                "criterion": "maximum_cross_fitted_oof_f1",
+                "selection_source": "development_out_of_fold",
+                "holdout_used_for_selection": False,
+                "curve": development_threshold_curve,
+                "holdout_at_recommended_threshold": recommended_holdout,
             },
             "fairness": fairness,
         })
@@ -330,17 +392,18 @@ async def train(
             "X_test": X_test,
         }
     champion = max(results, key=lambda result: result["auc_pr"]["mean"] + result["f1"]["mean"])["algorithm"]
-    champion_artifact = fitted_artifacts[champion]
-    champion_pipeline = champion_artifact["pipeline"]
-    preprocess = champion_pipeline.named_steps["preprocess"]
-    model = champion_pipeline.named_steps["model"]
-    transformed_dev = preprocess.transform(champion_artifact["X_dev"])
-    transformed_test = preprocess.transform(champion_artifact["X_test"])
+    explanation_model = xai_model if xai_model in fitted_artifacts else champion
+    explanation_artifact = fitted_artifacts[explanation_model]
+    explanation_pipeline = explanation_artifact["pipeline"]
+    preprocess = explanation_pipeline.named_steps["preprocess"]
+    model = explanation_pipeline.named_steps["model"]
+    transformed_dev = preprocess.transform(explanation_artifact["X_dev"])
+    transformed_test = preprocess.transform(explanation_artifact["X_test"])
     feature_names = [str(name) for name in preprocess.get_feature_names_out()]
     background = transformed_dev[: min(100, len(transformed_dev))]
     explained = transformed_test[: min(40, len(transformed_test))]
     try:
-        if champion == "Regressão Logística":
+        if explanation_model == "Regressão Logística":
             shap_values = shap.LinearExplainer(model, background)(explained).values
         else:
             shap_values = shap.TreeExplainer(model)(explained).values
@@ -348,7 +411,7 @@ async def train(
             shap_values = shap_values[:, :, -1]
         global_importance = np.mean(np.abs(shap_values), axis=0)
         shap_result = [
-            {"feature": feature_names[index], "mean_abs_shap": float(global_importance[index])}
+            {"feature": feature_names[index], "display_feature": _display_feature(feature_names[index]), "mean_abs_shap": float(global_importance[index])}
             for index in np.argsort(global_importance)[::-1][:12]
         ]
     except Exception as error:
@@ -366,20 +429,20 @@ async def train(
             model.predict_proba,
             num_features=min(10, len(feature_names)),
         )
-        lime_result = [{"condition": condition, "weight": float(weight)} for condition, weight in lime_explanation.as_list()]
+        lime_result = [{"condition": condition, "display_condition": _display_feature(condition), "weight": float(weight), "scale": "transformed"} for condition, weight in lime_explanation.as_list()]
     except Exception as error:
         lime_result = [{"status": "unavailable", "reason": str(error)[:180]}]
     pdp_result = []
-    for feature in champion_artifact["X_dev"].select_dtypes(include=np.number).columns[:5]:
+    for feature in explanation_artifact["X_dev"].select_dtypes(include=np.number).columns[:5]:
         try:
-            dependence = partial_dependence(champion_pipeline, champion_artifact["X_dev"], [feature], grid_resolution=12)
+            dependence = partial_dependence(explanation_pipeline, explanation_artifact["X_dev"], [feature], grid_resolution=12)
             grid = dependence["grid_values"][0]
             average = dependence["average"][0]
             pdp_result.append({"feature": str(feature), "points": [{"value": float(x), "prediction": float(y)} for x, y in zip(grid, average)]})
         except Exception:
             continue
     return {
-        "schema_version": "7.3",
+        "schema_version": "7.4",
         "experiment_id": str(uuid.uuid4()),
         "dataset_sha256": hashlib.sha256(raw).hexdigest(),
         "random_seed": SEED,
@@ -406,12 +469,27 @@ async def train(
         },
         "results": results,
         "champion": champion,
+        "scientific_protocol": {
+            "holdout_locked": True,
+            "calibration_selection": "cross_fitted_out_of_fold_development",
+            "threshold_selection": "cross_fitted_out_of_fold_development",
+            "holdout_used_for_selection": False,
+            "confidence_intervals": "bootstrap_95_percent_400_resamples",
+        },
         "explainability": {
             "source": "science-api",
             "status": "scientific",
-            "model": champion,
+            "model": explanation_model,
             "shap_global": shap_result,
-            "lime_local": {"holdout_row": 0, "features": lime_result},
+            "lime_local": {
+                "holdout_row": 0,
+                "features": lime_result,
+                "raw_instance": {
+                    str(key): (None if pd.isna(value) else value.item() if hasattr(value, "item") else value)
+                    for key, value in explanation_artifact["X_test"].iloc[0].to_dict().items()
+                },
+                "note": "Condições LIME usam a escala transformada; valores originais são fornecidos em raw_instance.",
+            },
             "partial_dependence": pdp_result,
         },
     }
