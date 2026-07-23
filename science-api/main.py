@@ -133,6 +133,17 @@ def _models(class_weight: bool, positive_weight: float):
     ]
 
 
+def _augment_for_missingness(X: pd.DataFrame, y: pd.Series, seed: int, rate: float = .08):
+    """Duplica apenas dados de treino com missingness aleatória para robustez."""
+    augmented = X.copy()
+    rng = np.random.default_rng(seed)
+    augmented = augmented.mask(rng.random(augmented.shape) < rate)
+    return (
+        pd.concat([X, augmented], ignore_index=True),
+        pd.concat([y.reset_index(drop=True), y.reset_index(drop=True)], ignore_index=True),
+    )
+
+
 def _summary(values: list[float]) -> dict[str, float]:
     return {"mean": float(np.mean(values)), "std": float(np.std(values))}
 
@@ -310,10 +321,13 @@ async def train(
                 steps.append(("balance", RandomUnderSampler(random_state=SEED)))
             steps.append(("model", estimator))
             pipeline = Pipeline(steps)
+            fold_X, fold_y = _augment_for_missingness(
+                X_dev.iloc[train_index], y_dev.iloc[train_index], SEED + fold_index
+            )
             fit_options = {}
             if imbalance == "class_weight" and algorithm == "Gradient Boosting":
-                fit_options["model__sample_weight"] = compute_sample_weight("balanced", y_dev.iloc[train_index])
-            pipeline.fit(X_dev.iloc[train_index], y_dev.iloc[train_index], **fit_options)
+                fit_options["model__sample_weight"] = compute_sample_weight("balanced", fold_y)
+            pipeline.fit(fold_X, fold_y, **fit_options)
             probability = pipeline.predict_proba(X_dev.iloc[valid_index])[:, 1]
             oof_probability[valid_index] = probability
             prediction = (probability >= threshold).astype(int)
@@ -330,10 +344,11 @@ async def train(
         elif imbalance == "undersampling":
             final_steps.append(("balance", RandomUnderSampler(random_state=SEED)))
         final_steps.append(("model", estimator))
+        final_X, final_y = _augment_for_missingness(X_dev, y_dev, SEED + 71)
         final_fit_options = {}
         if imbalance == "class_weight" and algorithm == "Gradient Boosting":
-            final_fit_options["model__sample_weight"] = compute_sample_weight("balanced", y_dev)
-        final_pipeline = Pipeline(final_steps).fit(X_dev, y_dev, **final_fit_options)
+            final_fit_options["model__sample_weight"] = compute_sample_weight("balanced", final_y)
+        final_pipeline = Pipeline(final_steps).fit(final_X, final_y, **final_fit_options)
         raw_probability = final_pipeline.predict_proba(X_test)[:, 1]
         calibration_mask = np.isfinite(oof_probability)
         development_probability = oof_probability[calibration_mask]
