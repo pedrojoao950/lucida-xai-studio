@@ -23,6 +23,7 @@ from imblearn.under_sampling import RandomUnderSampler
 from lightgbm import LGBMClassifier
 from lime.lime_tabular import LimeTabularExplainer
 from sklearn.calibration import calibration_curve
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
@@ -63,6 +64,26 @@ app.add_middleware(
 )
 
 
+class QuantileClipper(BaseEstimator, TransformerMixin):
+    """Winsoriza extremos usando apenas quantis aprendidos no conjunto de treino."""
+
+    def __init__(self, lower: float = .01, upper: float = .99):
+        self.lower = lower
+        self.upper = upper
+
+    def fit(self, X, y=None):
+        values = np.asarray(X, dtype=float)
+        self.lower_bounds_ = np.nanquantile(values, self.lower, axis=0)
+        self.upper_bounds_ = np.nanquantile(values, self.upper, axis=0)
+        return self
+
+    def transform(self, X):
+        return np.clip(np.asarray(X, dtype=float), self.lower_bounds_, self.upper_bounds_)
+
+    def get_feature_names_out(self, input_features=None):
+        return np.asarray(input_features, dtype=object)
+
+
 def _preprocessor(
     frame: pd.DataFrame,
     encoding: str,
@@ -79,9 +100,11 @@ def _preprocessor(
         if scaling == "minmax"
         else "passthrough"
     )
-    number_pipe = SkPipeline(
-        [("imputer", SimpleImputer(strategy=numeric_imputer)), ("scaler", scaler)]
-    )
+    number_pipe = SkPipeline([
+        ("imputer", SimpleImputer(strategy=numeric_imputer)),
+        ("clip_extremes", QuantileClipper()),
+        ("scaler", scaler),
+    ])
     category_imputer = (
         SimpleImputer(strategy="constant", fill_value="Ausente")
         if categorical_imputer == "constant"
@@ -399,6 +422,7 @@ async def train(
             "curve": [{"predicted": float(x), "observed": float(y)} for x, y in zip(mean_predicted, fraction_positive)],
         }
         recommended_holdout = _threshold_point(y_test, probability, best_threshold["threshold"])
+        robustness_baseline = recommended_holdout
         robustness_scenarios = []
         numeric_columns = X_test.select_dtypes(include=np.number).columns.tolist()
         for severity in (.05, .10, .20):
@@ -411,14 +435,14 @@ async def train(
             perturbed_probability, _ = _apply_calibrator(
                 selected_calibration, development_probability, development_y, perturbed_raw
             )
-            point = _threshold_point(y_test, perturbed_probability, threshold)
+            point = _threshold_point(y_test, perturbed_probability, best_threshold["threshold"])
             perturbed_precision, perturbed_recall, _ = precision_recall_curve(y_test, perturbed_probability)
             robustness_scenarios.append({
                 "scenario": "numeric_noise",
                 "severity": severity,
                 **point,
                 "auc_pr": float(auc(perturbed_recall, perturbed_precision)),
-                "f1_degradation": float(holdout["f1"] - point["f1"]),
+                "f1_degradation": float(robustness_baseline["f1"] - point["f1"]),
             })
         missing = X_test.copy()
         missing_rng = np.random.default_rng(SEED + 99)
@@ -428,20 +452,59 @@ async def train(
         missing_probability, _ = _apply_calibrator(
             selected_calibration, development_probability, development_y, missing_raw
         )
-        missing_point = _threshold_point(y_test, missing_probability, threshold)
+        missing_point = _threshold_point(y_test, missing_probability, best_threshold["threshold"])
         missing_precision, missing_recall, _ = precision_recall_curve(y_test, missing_probability)
         robustness_scenarios.append({
             "scenario": "missing_values",
             "severity": .10,
             **missing_point,
             "auc_pr": float(auc(missing_recall, missing_precision)),
-            "f1_degradation": float(holdout["f1"] - missing_point["f1"]),
+            "f1_degradation": float(robustness_baseline["f1"] - missing_point["f1"]),
         })
+        categorical_columns = X_test.select_dtypes(exclude=np.number).columns.tolist()
+        if categorical_columns:
+            unseen = X_test.copy()
+            unseen_rng = np.random.default_rng(SEED + 121)
+            for column in categorical_columns:
+                mask = unseen_rng.random(len(unseen)) < .10
+                unseen.loc[mask, column] = "__LUCIDA_UNSEEN__"
+            unseen_raw = final_pipeline.predict_proba(unseen)[:, 1]
+            unseen_probability, _ = _apply_calibrator(
+                selected_calibration, development_probability, development_y, unseen_raw
+            )
+            unseen_point = _threshold_point(y_test, unseen_probability, best_threshold["threshold"])
+            robustness_scenarios.append({
+                "scenario": "unknown_categories",
+                "severity": .10,
+                **unseen_point,
+                "f1_degradation": float(robustness_baseline["f1"] - unseen_point["f1"]),
+            })
+        if numeric_columns:
+            outliers = X_test.copy()
+            outlier_rng = np.random.default_rng(SEED + 141)
+            for column in numeric_columns:
+                mask = outlier_rng.random(len(outliers)) < .05
+                scale = float(X_dev[column].std()) or 1.0
+                direction = outlier_rng.choice([-1.0, 1.0], int(mask.sum()))
+                outliers.loc[mask, column] = outliers.loc[mask, column] + direction * 6 * scale
+            outlier_raw = final_pipeline.predict_proba(outliers)[:, 1]
+            outlier_probability, _ = _apply_calibrator(
+                selected_calibration, development_probability, development_y, outlier_raw
+            )
+            outlier_point = _threshold_point(y_test, outlier_probability, best_threshold["threshold"])
+            robustness_scenarios.append({
+                "scenario": "extreme_values",
+                "severity": .05,
+                **outlier_point,
+                "f1_degradation": float(robustness_baseline["f1"] - outlier_point["f1"]),
+            })
         worst_degradation = max(0.0, max(item["f1_degradation"] for item in robustness_scenarios))
         robustness = {
             "source": "science-api",
             "status": "scientific",
-            "baseline_f1": holdout["f1"],
+            "baseline_f1": robustness_baseline["f1"],
+            "threshold": best_threshold["threshold"],
+            "threshold_source": "development_out_of_fold_recommendation",
             "worst_f1_degradation": worst_degradation,
             "stability_score": float(max(0, 1 - worst_degradation)),
             "scenarios": robustness_scenarios,
