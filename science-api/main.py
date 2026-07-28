@@ -41,7 +41,7 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
-from sklearn.model_selection import StratifiedKFold, TimeSeriesSplit
+from sklearn.model_selection import StratifiedKFold, TimeSeriesSplit, train_test_split
 from sklearn.inspection import partial_dependence
 from sklearn.isotonic import IsotonicRegression
 from sklearn.pipeline import Pipeline as SkPipeline
@@ -51,7 +51,7 @@ from xgboost import XGBClassifier
 
 SEED = 42
 MODEL_CACHE: dict[str, dict] = {}
-app = FastAPI(title="LÚCIDA Science API", version="7.12")
+app = FastAPI(title="LÚCIDA Science API", version="7.13")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -236,7 +236,7 @@ def _paired_f1_comparison(y_true, champion_probability, candidate_probability, c
 
 @app.get("/")
 def root():
-    return {"service": "LÚCIDA Science API", "version": "7.12", "status": "online"}
+    return {"service": "LÚCIDA Science API", "version": "7.13", "status": "online"}
 
 
 @app.get("/health")
@@ -318,14 +318,25 @@ async def train(
         raise HTTPException(422, "A classe positiva selecionada não existe na coluna-alvo")
     positive_class = selected_positive_class
     y = (labels == positive_class).astype(int)
+    if validation == "stratified" and int(y.value_counts().min()) < 2:
+        raise HTTPException(422, "A classe positiva precisa de pelo menos dois registos para criar um holdout estratificado")
     cut = int(len(frame) * .8)
     if cut < folds or len(frame) - cut < 2:
         raise HTTPException(422, "Dataset insuficiente para validação e holdout")
-    X_dev, X_test, y_dev, y_test = X.iloc[:cut], X.iloc[cut:], y.iloc[:cut], y.iloc[cut:]
+    if validation == "stratified":
+        X_dev, X_test, y_dev, y_test = train_test_split(
+            X,
+            y,
+            test_size=.2,
+            stratify=y,
+            random_state=SEED,
+        )
+    else:
+        X_dev, X_test, y_dev, y_test = X.iloc[:cut], X.iloc[cut:], y.iloc[:cut], y.iloc[cut:]
     if y_dev.nunique() < 2:
         raise HTTPException(422, "O conjunto de desenvolvimento contém apenas uma classe após a divisão 80/20")
     if y_test.nunique() < 2:
-        raise HTTPException(422, "O holdout final contém apenas uma classe; ajuste a ordem temporal ou a classe positiva")
+        raise HTTPException(422, "O holdout temporal contém apenas uma classe; reveja a janela temporal ou a classe positiva")
     negative, positive = np.bincount(y_dev, minlength=2)
     positive_weight = float(negative / max(1, positive))
     splitter = (
@@ -709,7 +720,7 @@ async def train(
         "created_at": pd.Timestamp.utcnow().isoformat(),
     }
     return {
-        "schema_version": "7.12",
+        "schema_version": "7.13",
         "experiment_id": experiment_id,
         "dataset_sha256": hashlib.sha256(raw).hexdigest(),
         "random_seed": SEED,
