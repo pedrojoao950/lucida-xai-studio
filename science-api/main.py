@@ -17,6 +17,7 @@ import sklearn
 import xgboost
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from imblearn.over_sampling import SMOTE
 from imblearn.pipeline import Pipeline
 from imblearn.under_sampling import RandomUnderSampler
@@ -50,7 +51,7 @@ from xgboost import XGBClassifier
 
 SEED = 42
 MODEL_CACHE: dict[str, dict] = {}
-app = FastAPI(title="LÚCIDA Science API", version="7.11")
+app = FastAPI(title="LÚCIDA Science API", version="7.12")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -62,6 +63,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.exception_handler(Exception)
+async def unexpected_error(_: Request, error: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"{type(error).__name__}: {error}"},
+    )
 
 
 class QuantileClipper(BaseEstimator, TransformerMixin):
@@ -228,7 +236,7 @@ def _paired_f1_comparison(y_true, champion_probability, candidate_probability, c
 
 @app.get("/")
 def root():
-    return {"service": "LÚCIDA Science API", "version": "7.11", "status": "online"}
+    return {"service": "LÚCIDA Science API", "version": "7.12", "status": "online"}
 
 
 @app.get("/health")
@@ -314,6 +322,10 @@ async def train(
     if cut < folds or len(frame) - cut < 2:
         raise HTTPException(422, "Dataset insuficiente para validação e holdout")
     X_dev, X_test, y_dev, y_test = X.iloc[:cut], X.iloc[cut:], y.iloc[:cut], y.iloc[cut:]
+    if y_dev.nunique() < 2:
+        raise HTTPException(422, "O conjunto de desenvolvimento contém apenas uma classe após a divisão 80/20")
+    if y_test.nunique() < 2:
+        raise HTTPException(422, "O holdout final contém apenas uma classe; ajuste a ordem temporal ou a classe positiva")
     negative, positive = np.bincount(y_dev, minlength=2)
     positive_weight = float(negative / max(1, positive))
     splitter = (
@@ -323,6 +335,16 @@ async def train(
     )
     split_iterator = splitter.split(X_dev, y_dev)
     splits = list(split_iterator)
+    invalid_folds = [
+        index
+        for index, (train_index, valid_index) in enumerate(splits, 1)
+        if y_dev.iloc[train_index].nunique() < 2 or y_dev.iloc[valid_index].nunique() < 2
+    ]
+    if invalid_folds:
+        raise HTTPException(
+            422,
+            f"As dobras {invalid_folds} não contêm ambas as classes; reduza os folds, reveja a classe positiva ou use validação estratificada",
+        )
     results = []
     fitted_artifacts = {}
     for algorithm, estimator in _models(imbalance == "class_weight", positive_weight):
@@ -687,7 +709,7 @@ async def train(
         "created_at": pd.Timestamp.utcnow().isoformat(),
     }
     return {
-        "schema_version": "7.11",
+        "schema_version": "7.12",
         "experiment_id": experiment_id,
         "dataset_sha256": hashlib.sha256(raw).hexdigest(),
         "random_seed": SEED,
