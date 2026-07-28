@@ -50,7 +50,7 @@ from xgboost import XGBClassifier
 
 SEED = 42
 MODEL_CACHE: dict[str, dict] = {}
-app = FastAPI(title="LÚCIDA Science API", version="7.9")
+app = FastAPI(title="LÚCIDA Science API", version="7.10")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -126,10 +126,10 @@ def _models(class_weight: bool, positive_weight: float):
     weight = "balanced" if class_weight else None
     return [
         ("Regressão Logística", LogisticRegression(max_iter=2000, class_weight=weight, random_state=SEED)),
-        ("Random Forest", RandomForestClassifier(n_estimators=250, class_weight=weight, random_state=SEED, n_jobs=-1)),
+        ("Random Forest", RandomForestClassifier(n_estimators=100, class_weight=weight, random_state=SEED, n_jobs=-1)),
         ("Gradient Boosting", GradientBoostingClassifier(random_state=SEED)),
-        ("XGBoost", XGBClassifier(n_estimators=250, max_depth=5, learning_rate=.05, subsample=.9, colsample_bytree=.9, scale_pos_weight=positive_weight if class_weight else 1, random_state=SEED, n_jobs=-1)),
-        ("LightGBM", LGBMClassifier(n_estimators=250, learning_rate=.05, class_weight=weight, random_state=SEED, verbosity=-1, n_jobs=-1)),
+        ("XGBoost", XGBClassifier(n_estimators=100, max_depth=5, learning_rate=.05, subsample=.9, colsample_bytree=.9, scale_pos_weight=positive_weight if class_weight else 1, random_state=SEED, n_jobs=-1)),
+        ("LightGBM", LGBMClassifier(n_estimators=100, learning_rate=.05, class_weight=weight, random_state=SEED, verbosity=-1, n_jobs=-1)),
     ]
 
 
@@ -178,7 +178,7 @@ def _threshold_point(y_true, probability, candidate: float):
     }
 
 
-def _bootstrap_intervals(y_true, probability, threshold: float, samples: int = 400):
+def _bootstrap_intervals(y_true, probability, threshold: float, samples: int = 100):
     truth = np.asarray(y_true)
     probability = np.asarray(probability)
     rng = np.random.default_rng(SEED)
@@ -209,7 +209,7 @@ def _paired_f1_comparison(y_true, champion_probability, candidate_probability, c
     truth = np.asarray(y_true)
     rng = np.random.default_rng(SEED)
     differences = []
-    for _ in range(400):
+    for _ in range(100):
         index = rng.integers(0, len(truth), len(truth))
         champion_prediction = (np.asarray(champion_probability)[index] >= champion_threshold).astype(int)
         candidate_prediction = (np.asarray(candidate_probability)[index] >= candidate_threshold).astype(int)
@@ -228,7 +228,7 @@ def _paired_f1_comparison(y_true, champion_probability, candidate_probability, c
 
 @app.get("/")
 def root():
-    return {"service": "LÚCIDA Science API", "version": "7.9", "status": "online"}
+    return {"service": "LÚCIDA Science API", "version": "7.10", "status": "online"}
 
 
 @app.get("/health")
@@ -285,6 +285,18 @@ async def train(
     feature_columns = [column for column in frame.columns if column not in {target, *excluded}]
     if date_column in feature_columns:
         feature_columns.remove(date_column)
+    automatic_high_cardinality = [
+        column
+        for column in feature_columns
+        if (
+            not pd.api.types.is_numeric_dtype(frame[column])
+            and frame[column].notna().sum() >= 50
+            and frame[column].nunique(dropna=True) / max(1, frame[column].notna().sum()) > .8
+        )
+    ]
+    if automatic_high_cardinality:
+        feature_columns = [column for column in feature_columns if column not in automatic_high_cardinality]
+        excluded = list(dict.fromkeys([*excluded, *automatic_high_cardinality]))
     if not feature_columns:
         raise HTTPException(422, "Nenhuma variável explicativa disponível")
     X = frame[feature_columns]
@@ -321,9 +333,7 @@ async def train(
                 steps.append(("balance", RandomUnderSampler(random_state=SEED)))
             steps.append(("model", estimator))
             pipeline = Pipeline(steps)
-            fold_X, fold_y = _augment_for_missingness(
-                X_dev.iloc[train_index], y_dev.iloc[train_index], SEED + fold_index
-            )
+            fold_X, fold_y = X_dev.iloc[train_index], y_dev.iloc[train_index]
             fit_options = {}
             if imbalance == "class_weight" and algorithm == "Gradient Boosting":
                 fit_options["model__sample_weight"] = compute_sample_weight("balanced", fold_y)
@@ -344,7 +354,7 @@ async def train(
         elif imbalance == "undersampling":
             final_steps.append(("balance", RandomUnderSampler(random_state=SEED)))
         final_steps.append(("model", estimator))
-        final_X, final_y = _augment_for_missingness(X_dev, y_dev, SEED + 71)
+        final_X, final_y = X_dev, y_dev
         final_fit_options = {}
         if imbalance == "class_weight" and algorithm == "Gradient Boosting":
             final_fit_options["model__sample_weight"] = compute_sample_weight("balanced", final_y)
@@ -673,7 +683,7 @@ async def train(
         "created_at": pd.Timestamp.utcnow().isoformat(),
     }
     return {
-        "schema_version": "7.9",
+        "schema_version": "7.10",
         "experiment_id": experiment_id,
         "dataset_sha256": hashlib.sha256(raw).hexdigest(),
         "random_seed": SEED,
@@ -715,7 +725,7 @@ async def train(
             "source": "approved" if approval_complete else "development_out_of_fold_recommendation",
         },
         "statistical_comparison": {
-            "method": "paired_bootstrap_400_resamples",
+            "method": "paired_bootstrap_100_resamples",
             "comparisons": statistical_comparison,
             "non_inferior_models": non_inferior_models,
             "deployment_preference": champion,
@@ -789,7 +799,7 @@ async def train(
             "calibration_selection": "cross_fitted_out_of_fold_development",
             "threshold_selection": "cross_fitted_out_of_fold_development",
             "holdout_used_for_selection": False,
-            "confidence_intervals": "bootstrap_95_percent_400_resamples",
+            "confidence_intervals": "bootstrap_95_percent_100_resamples",
             "robustness": "numeric_noise_and_missingness_stress_tests",
             "model_comparison": "paired_bootstrap_holdout_f1",
             "deployment_gate": "required_and_recommended_checks",
@@ -1098,7 +1108,7 @@ async def monitor(experiment_id: str, request: Request):
         "results": results,
         "champion": champion,
         "statistical_comparison": {
-            "method": "paired_bootstrap_400_resamples",
+            "method": "paired_bootstrap_100_resamples",
             "comparisons": statistical_comparison,
             "non_inferior_models": non_inferior_models,
             "deployment_preference": champion if champion in non_inferior_models else non_inferior_models[0],
@@ -1179,7 +1189,7 @@ async def monitor(experiment_id: str, request: Request):
             "calibration_selection": "cross_fitted_out_of_fold_development",
             "threshold_selection": "cross_fitted_out_of_fold_development",
             "holdout_used_for_selection": False,
-            "confidence_intervals": "bootstrap_95_percent_400_resamples",
+            "confidence_intervals": "bootstrap_95_percent_100_resamples",
             "robustness": "numeric_noise_and_missingness_stress_tests",
             "model_comparison": "paired_bootstrap_holdout_f1",
             "deployment_gate": "required_and_recommended_checks",
