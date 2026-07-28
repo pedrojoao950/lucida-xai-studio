@@ -50,7 +50,7 @@ from xgboost import XGBClassifier
 
 SEED = 42
 MODEL_CACHE: dict[str, dict] = {}
-app = FastAPI(title="LÚCIDA Science API", version="7.10")
+app = FastAPI(title="LÚCIDA Science API", version="7.11")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -228,7 +228,7 @@ def _paired_f1_comparison(y_true, champion_probability, candidate_probability, c
 
 @app.get("/")
 def root():
-    return {"service": "LÚCIDA Science API", "version": "7.10", "status": "online"}
+    return {"service": "LÚCIDA Science API", "version": "7.11", "status": "online"}
 
 
 @app.get("/health")
@@ -240,6 +240,7 @@ def health():
 async def train(
     file: UploadFile = File(...),
     target: str = Form(...),
+    positive_class: str = Form(""),
     validation: Literal["stratified", "temporal"] = Form("stratified"),
     folds: int = Form(5),
     date_column: str = Form(""),
@@ -302,9 +303,12 @@ async def train(
     X = frame[feature_columns]
     labels = frame[target].astype(str)
     classes = labels.value_counts().index.tolist()
-    if len(classes) != 2:
-        raise HTTPException(422, "A fase 7.2 suporta classificação binária")
-    positive_class = str(classes[-1])
+    if len(classes) < 2:
+        raise HTTPException(422, "A coluna-alvo deve conter pelo menos duas classes")
+    selected_positive_class = positive_class.strip() or str(classes[-1])
+    if selected_positive_class not in classes:
+        raise HTTPException(422, "A classe positiva selecionada não existe na coluna-alvo")
+    positive_class = selected_positive_class
     y = (labels == positive_class).astype(int)
     cut = int(len(frame) * .8)
     if cut < folds or len(frame) - cut < 2:
@@ -683,7 +687,7 @@ async def train(
         "created_at": pd.Timestamp.utcnow().isoformat(),
     }
     return {
-        "schema_version": "7.10",
+        "schema_version": "7.11",
         "experiment_id": experiment_id,
         "dataset_sha256": hashlib.sha256(raw).hexdigest(),
         "random_seed": SEED,
