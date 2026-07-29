@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
@@ -51,7 +52,8 @@ from xgboost import XGBClassifier
 
 SEED = 42
 MODEL_CACHE: dict[str, dict] = {}
-app = FastAPI(title="LÚCIDA Science API", version="7.13")
+TRAIN_JOBS: dict[str, dict] = {}
+app = FastAPI(title="LÚCIDA Science API", version="7.14")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -236,7 +238,7 @@ def _paired_f1_comparison(y_true, champion_probability, candidate_probability, c
 
 @app.get("/")
 def root():
-    return {"service": "LÚCIDA Science API", "version": "7.13", "status": "online"}
+    return {"service": "LÚCIDA Science API", "version": "7.14", "status": "online"}
 
 
 @app.get("/health")
@@ -720,7 +722,7 @@ async def train(
         "created_at": pd.Timestamp.utcnow().isoformat(),
     }
     return {
-        "schema_version": "7.13",
+        "schema_version": "7.14",
         "experiment_id": experiment_id,
         "dataset_sha256": hashlib.sha256(raw).hexdigest(),
         "random_seed": SEED,
@@ -966,6 +968,72 @@ def _calculate_explainability(artifact: dict, experiment_id: str):
         "partial_dependence": pdp_result,
         "errors": errors,
     }
+
+
+@app.post("/v1/train/jobs", status_code=202)
+async def start_train_job(request: Request):
+    form = await request.form()
+    source = form.get("file")
+    if source is None or not hasattr(source, "read"):
+        raise HTTPException(422, "Ficheiro CSV não fornecido")
+    raw = await source.read()
+    filename = source.filename or "dataset.csv"
+    job_id = str(uuid.uuid4())
+    TRAIN_JOBS[job_id] = {"status": "pending"}
+
+    def text(name: str, default: str = "") -> str:
+        value = form.get(name)
+        return str(value) if value is not None else default
+
+    def boolean(name: str, default: bool = False) -> bool:
+        return text(name, str(default)).lower() in {"1", "true", "yes", "sim"}
+
+    async def execute():
+        upload = UploadFile(file=io.BytesIO(raw), filename=filename)
+        return await train(
+            file=upload,
+            target=text("target"),
+            positive_class=text("positive_class"),
+            validation=text("validation", "stratified"),
+            folds=int(text("folds", "5")),
+            date_column=text("date_column"),
+            encoding=text("encoding", "onehot"),
+            scaling=text("scaling", "standard"),
+            numeric_imputer=text("numeric_imputer", "median"),
+            categorical_imputer=text("categorical_imputer", "most_frequent"),
+            imbalance=text("imbalance", "class_weight"),
+            excluded_features=text("excluded_features", "[]"),
+            threshold=float(text("threshold", ".5")),
+            calibration=text("calibration", "auto"),
+            protected_feature=text("protected_feature"),
+            xai_model=text("xai_model"),
+            fairness_declaration=text("fairness_declaration", "not_evaluated"),
+            threshold_approved=boolean("threshold_approved"),
+            approver_name=text("approver_name"),
+            approver_role=text("approver_role"),
+            approval_reason=text("approval_reason"),
+            lifecycle_state=text("lifecycle_state", "candidate"),
+        )
+
+    async def run_job():
+        try:
+            result = await asyncio.to_thread(lambda: asyncio.run(execute()))
+            TRAIN_JOBS[job_id] = {"status": "succeeded", "result": result}
+        except HTTPException as error:
+            TRAIN_JOBS[job_id] = {"status": "failed", "status_code": error.status_code, "detail": error.detail}
+        except Exception as error:
+            TRAIN_JOBS[job_id] = {"status": "failed", "status_code": 500, "detail": f"{type(error).__name__}: {error}"}
+
+    asyncio.create_task(run_job())
+    return {"job_id": job_id, "status": "pending"}
+
+
+@app.get("/v1/train/jobs/{job_id}")
+def get_train_job(job_id: str):
+    job = TRAIN_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Tarefa científica não encontrada")
+    return job
 
 
 @app.post("/v1/explain/{experiment_id}")
