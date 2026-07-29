@@ -53,7 +53,7 @@ from xgboost import XGBClassifier
 SEED = 42
 MODEL_CACHE: dict[str, dict] = {}
 TRAIN_JOBS: dict[str, dict] = {}
-app = FastAPI(title="LÚCIDA Science API", version="7.14")
+app = FastAPI(title="LÚCIDA Science API", version="7.15")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -92,6 +92,59 @@ class QuantileClipper(BaseEstimator, TransformerMixin):
 
     def get_feature_names_out(self, input_features=None):
         return np.asarray(input_features, dtype=object)
+
+
+def _select_temporal_holdout(
+    frame: pd.DataFrame,
+    y: pd.Series,
+    date_column: str,
+    folds: int,
+) -> tuple[int, dict]:
+    """Seleciona o corte cronológico viável mais próximo de 80/20.
+
+    O corte só pode ocorrer entre datas distintas e ambos os lados precisam
+    conter as duas classes. Assim preservamos a ordem temporal sem transformar
+    silenciosamente o holdout numa amostra estratificada.
+    """
+
+    desired_cut = int(len(frame) * .8)
+    minimum_development_rows = max(folds + 2, 4)
+    candidates = []
+    for cut in range(minimum_development_rows, len(frame) - 1):
+        if frame[date_column].iloc[cut - 1] == frame[date_column].iloc[cut]:
+            continue
+        if y.iloc[:cut].nunique() < 2 or y.iloc[cut:].nunique() < 2:
+            continue
+        candidates.append(cut)
+
+    if not candidates:
+        positive_dates = frame.loc[y.eq(1), date_column]
+        negative_dates = frame.loc[y.eq(0), date_column]
+        detail = (
+            "Não existe um corte cronológico que mantenha as duas classes no "
+            "desenvolvimento e no holdout. Acrescente observações de ambas as "
+            "classes no período mais recente ou escolha outra coluna/janela temporal. "
+            f"Intervalo da classe positiva: {positive_dates.min()} a {positive_dates.max()}; "
+            f"intervalo da classe negativa: {negative_dates.min()} a {negative_dates.max()}."
+        )
+        raise HTTPException(422, detail)
+
+    cut = min(candidates, key=lambda value: (abs(value - desired_cut), -value))
+    return cut, {
+        "strategy": "chronological_class_complete",
+        "requested_ratio": .8,
+        "actual_development_ratio": round(cut / len(frame), 4),
+        "cutoff": frame[date_column].iloc[cut].isoformat(),
+        "development_period": {
+            "start": frame[date_column].iloc[0].isoformat(),
+            "end": frame[date_column].iloc[cut - 1].isoformat(),
+        },
+        "holdout_period": {
+            "start": frame[date_column].iloc[cut].isoformat(),
+            "end": frame[date_column].iloc[-1].isoformat(),
+        },
+        "adjusted_from_80_20": cut != desired_cut,
+    }
 
 
 def _preprocessor(
@@ -238,7 +291,7 @@ def _paired_f1_comparison(y_true, champion_probability, candidate_probability, c
 
 @app.get("/")
 def root():
-    return {"service": "LÚCIDA Science API", "version": "7.14", "status": "online"}
+    return {"service": "LÚCIDA Science API", "version": "7.15", "status": "online"}
 
 
 @app.get("/health")
@@ -323,6 +376,9 @@ async def train(
     if validation == "stratified" and int(y.value_counts().min()) < 2:
         raise HTTPException(422, "A classe positiva precisa de pelo menos dois registos para criar um holdout estratificado")
     cut = int(len(frame) * .8)
+    temporal_holdout = None
+    if validation == "temporal":
+        cut, temporal_holdout = _select_temporal_holdout(frame, y, date_column, folds)
     if cut < folds or len(frame) - cut < 2:
         raise HTTPException(422, "Dataset insuficiente para validação e holdout")
     if validation == "stratified":
@@ -338,7 +394,7 @@ async def train(
     if y_dev.nunique() < 2:
         raise HTTPException(422, "O conjunto de desenvolvimento contém apenas uma classe após a divisão 80/20")
     if y_test.nunique() < 2:
-        raise HTTPException(422, "O holdout temporal contém apenas uma classe; reveja a janela temporal ou a classe positiva")
+        raise HTTPException(422, "O holdout final contém apenas uma classe")
     negative, positive = np.bincount(y_dev, minlength=2)
     positive_weight = float(negative / max(1, positive))
     splitter = (
@@ -722,7 +778,7 @@ async def train(
         "created_at": pd.Timestamp.utcnow().isoformat(),
     }
     return {
-        "schema_version": "7.14",
+        "schema_version": "7.15",
         "experiment_id": experiment_id,
         "dataset_sha256": hashlib.sha256(raw).hexdigest(),
         "random_seed": SEED,
@@ -737,6 +793,7 @@ async def train(
         "validation": validation,
         "development_rows": len(X_dev),
         "test_rows": len(X_test),
+        "temporal_holdout": temporal_holdout,
         "pipeline": {
             "numeric_imputer": numeric_imputer,
             "categorical_imputer": categorical_imputer,
